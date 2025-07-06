@@ -1,0 +1,21 @@
+[project]
+name = "skia"
+version = "0.1.0"
+dependencies = [
+  "blosc2==3.5.0",
+  "imageio[ffmpeg]==2.37.0",
+  "mss==10.0.0",
+  "numpy==2.3.1",
+  "pynput==1.8.1",
+]
+
+[project.scripts]
+skia = "skia.main:main"
+
+[tool.setuptools]
+packages = ["skia"]
+
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"

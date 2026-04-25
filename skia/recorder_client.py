@@ -27,11 +27,13 @@ class RecorderClient:
         self._process: subprocess.Popen[str] | None = None
         self._events: Queue[dict[str, Any]] = Queue()
         self._next_id = 0
+        self._closing = False
 
     def start_process(self) -> None:
         if self._process is not None and self._process.poll() is None:
             return
 
+        self._closing = False
         self._process = subprocess.Popen(
             self.command,
             cwd=self.cwd,
@@ -44,6 +46,7 @@ class RecorderClient:
 
         Thread(target=self._read_stdout, daemon=True).start()
         Thread(target=self._read_stderr, daemon=True).start()
+        Thread(target=self._monitor_process, daemon=True).start()
 
     def start_recording(
         self,
@@ -105,6 +108,7 @@ class RecorderClient:
         if process is None:
             return
 
+        self._closing = True
         if process.poll() is None:
             try:
                 self.stop_recording()
@@ -122,6 +126,9 @@ class RecorderClient:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                    process.wait(timeout=2)
+
+        self._close_pipes(process)
 
         self._process = None
 
@@ -178,3 +185,27 @@ class RecorderClient:
             line = line.rstrip()
             if self.on_log is not None:
                 self.on_log(line)
+
+    def _monitor_process(self) -> None:
+        process = self._process
+        if process is None:
+            return
+
+        return_code = process.wait()
+        if self._closing:
+            return
+
+        event = {
+            "event": "error",
+            "id": None,
+            "code": "daemon_exited",
+            "message": f"recorder daemon exited with code {return_code}",
+        }
+        self._events.put(event)
+        if self.on_event is not None:
+            self.on_event(event)
+
+    def _close_pipes(self, process: subprocess.Popen[str]) -> None:
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None and not pipe.closed:
+                pipe.close()

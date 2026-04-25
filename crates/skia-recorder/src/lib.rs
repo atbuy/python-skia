@@ -3,6 +3,12 @@ use std::io::{BufRead, Write};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod export;
+mod segment;
+
+pub use export::{ExportError, export_clip, ffmpeg_args, write_concat_file};
+pub use segment::{Segment, SegmentRing};
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -105,7 +111,9 @@ pub enum ErrorCode {
     InvalidCommand,
     AlreadyRecording,
     NotRecording,
+    NoSegments,
     ExportUnavailable,
+    ExportFailed,
 }
 
 #[derive(Debug, Error)]
@@ -125,6 +133,7 @@ pub struct RecorderDaemon {
 struct DaemonState {
     recording: bool,
     backend: Option<BackendName>,
+    segments: Option<SegmentRing>,
 }
 
 impl RecorderDaemon {
@@ -161,6 +170,7 @@ impl RecorderDaemon {
         let backend = select_backend(config.backend);
         self.state.recording = true;
         self.state.backend = Some(backend);
+        self.state.segments = Some(SegmentRing::new(config.clip_seconds, 6));
 
         vec![Event::RecordingStarted { id, backend }]
     }
@@ -174,17 +184,40 @@ impl RecorderDaemon {
             }];
         }
 
+        let segments = self
+            .state
+            .segments
+            .as_ref()
+            .map(|ring| ring.select_last(seconds))
+            .unwrap_or_default();
+
+        if segments.is_empty() {
+            return vec![Event::Error {
+                id: Some(id),
+                code: ErrorCode::NoSegments,
+                message: "no recorded segments are available yet".to_string(),
+            }];
+        }
+
         tracing::info!(
             seconds,
             output,
-            "save_last requested before segment ring is implemented"
+            segment_count = segments.len(),
+            "exporting clip"
         );
 
-        vec![Event::Error {
-            id: Some(id),
-            code: ErrorCode::ExportUnavailable,
-            message: "clip export is not implemented yet".to_string(),
-        }]
+        match export_clip(&segments, std::path::Path::new(&output)) {
+            Ok(()) => vec![Event::ClipSaved {
+                id,
+                path: output,
+                duration_seconds: seconds,
+            }],
+            Err(error) => vec![Event::Error {
+                id: Some(id),
+                code: ErrorCode::ExportFailed,
+                message: error.to_string(),
+            }],
+        }
     }
 
     fn status(&self, id: String) -> Event {
@@ -202,6 +235,7 @@ impl RecorderDaemon {
     fn stop(&mut self, id: String) -> Vec<Event> {
         self.state.recording = false;
         self.state.backend = None;
+        self.state.segments = None;
         vec![Event::Stopped { id }]
     }
 }
@@ -364,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn save_last_before_segment_ring_returns_structured_error() {
+    fn save_last_before_segments_returns_structured_error() {
         let mut daemon = RecorderDaemon::new();
         daemon.handle_command(Command::Start {
             id: "start-1".to_string(),
@@ -385,8 +419,8 @@ mod tests {
             events,
             vec![Event::Error {
                 id: Some("save-1".to_string()),
-                code: ErrorCode::ExportUnavailable,
-                message: "clip export is not implemented yet".to_string(),
+                code: ErrorCode::NoSegments,
+                message: "no recorded segments are available yet".to_string(),
             }]
         );
     }

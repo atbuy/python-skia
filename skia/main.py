@@ -7,22 +7,28 @@ from typing import Any
 
 from pynput import keyboard
 
+from skia.config import SkiaConfig, load_config
 from skia.recorder_client import RecorderClient
 
 
 class SkiaApp:
-    def __init__(self):
+    def __init__(self, config: SkiaConfig | None = None):
         self.root = Path(__file__).resolve().parent.parent
-        self.output_dir = self.root.joinpath("out")
+        self.config = config or load_config(root=self.root)
+        self.output_dir = self.config.output_dir
         self.output_dir.mkdir(exist_ok=True)
         self.recorder = RecorderClient(on_event=self._on_event, on_log=self._on_log)
 
     def start(self) -> None:
         print("Starting Skia...")
         self.recorder.start_process()
-        self.recorder.start_recording()
+        self.recorder.start_recording(
+            clip_seconds=self.config.clip_seconds,
+            segment_seconds=self.config.segment_seconds,
+            backend=self.config.backend,
+        )
 
-        with keyboard.GlobalHotKeys({"<ctrl>+.": self.save_clip}) as hotkeys:
+        with keyboard.GlobalHotKeys({self.config.hotkey: self.save_clip}) as hotkeys:
             try:
                 while True:
                     time.sleep(0.25)
@@ -36,7 +42,7 @@ class SkiaApp:
     def save_clip(self) -> None:
         filename = datetime.now().strftime("%Y%m%d-%H%M%S")
         output = self.output_dir.joinpath(f"{filename}.mp4")
-        self.recorder.save_last(seconds=30, output=output)
+        self.recorder.save_last(seconds=self.config.clip_seconds, output=output)
 
     def _on_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("event")

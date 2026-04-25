@@ -36,6 +36,9 @@ pub enum Command {
     Status {
         id: String,
     },
+    Check {
+        id: String,
+    },
     Stop {
         id: String,
     },
@@ -47,6 +50,7 @@ impl Command {
             Self::Start { id, .. }
             | Self::SaveLast { id, .. }
             | Self::Status { id }
+            | Self::Check { id }
             | Self::Stop { id } => id,
         }
     }
@@ -95,6 +99,10 @@ pub enum Event {
         id: String,
         state: RecorderState,
         backend: Option<BackendName>,
+    },
+    Check {
+        id: String,
+        runtime: RuntimeChecks,
     },
     Stopped {
         id: String,
@@ -194,6 +202,7 @@ impl RecorderDaemon {
                 output,
             } => self.save_last(id, seconds, output),
             Command::Status { id } => self.status(id),
+            Command::Check { id } => vec![self.check(id)],
             Command::Stop { id } => self.stop(id),
         }
     }
@@ -358,6 +367,13 @@ impl RecorderDaemon {
 
         self.clear_recording_state();
         vec![Event::Stopped { id }]
+    }
+
+    fn check(&self, id: String) -> Event {
+        Event::Check {
+            id,
+            runtime: RuntimeChecks::detect(),
+        }
     }
 
     fn clear_recording_state(&mut self) {
@@ -779,6 +795,22 @@ mod tests {
         assert_eq!(
             lines[1],
             r#"{"event":"status","id":"1","state":"idle","backend":null}"#
+        );
+    }
+
+    #[test]
+    fn check_returns_runtime_details() {
+        let mut daemon = RecorderDaemon::with_runtime(TEST_RUNTIME);
+        let events = daemon.handle_command(Command::Check {
+            id: "check-1".to_string(),
+        });
+
+        assert_eq!(
+            events,
+            vec![Event::Check {
+                id: "check-1".to_string(),
+                runtime: RuntimeChecks::detect(),
+            }]
         );
     }
 }

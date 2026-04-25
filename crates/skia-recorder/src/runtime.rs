@@ -2,7 +2,8 @@ use std::process::Command;
 
 use crate::BackendName;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Platform {
     Linux,
     Windows,
@@ -10,7 +11,7 @@ pub enum Platform {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct RuntimeChecks {
     pub platform: Platform,
     pub ffmpeg_available: bool,

@@ -83,6 +83,9 @@ class RecorderClient:
     def status(self) -> str:
         return self.send("status")
 
+    def check(self) -> str:
+        return self.send("check")
+
     def stop_recording(self) -> str:
         return self.send("stop")
 

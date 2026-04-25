@@ -61,6 +61,12 @@ Run the app:
 python -m skia.main
 ```
 
+Check recorder runtime support:
+
+```bash
+python -m skia.main --check
+```
+
 Run a real desktop recording smoke test:
 
 ```bash

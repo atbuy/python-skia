@@ -6,8 +6,6 @@ import subprocess
 import time
 from typing import Any
 
-from pynput import keyboard
-
 from skia.config import SkiaConfig, load_config
 from skia.recorder_client import RecorderClient
 
@@ -21,6 +19,8 @@ class SkiaApp:
         self.recorder = RecorderClient(on_event=self._on_event, on_log=self._on_log)
 
     def start(self) -> None:
+        from pynput import keyboard
+
         print("Starting Skia...")
         self.start_recorder()
 
@@ -54,6 +54,23 @@ class SkiaApp:
         finally:
             self.recorder.close()
             print("Stopped Skia smoke test.")
+
+    def check(self) -> int:
+        self.recorder.start_process()
+        try:
+            self.recorder.check()
+            event = self._wait_for_any_event({"check", "error"}, timeout=10)
+            if event is None:
+                print("Timed out waiting for recorder check.")
+                return 1
+
+            if event.get("event") == "check":
+                print(f"Recorder check: {event.get('runtime')}")
+                return 0
+
+            return 1
+        finally:
+            self.recorder.close()
 
     def start_recorder(self) -> None:
         self.recorder.start_process()
@@ -125,6 +142,7 @@ class SkiaApp:
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true", help="print recorder runtime checks")
     parser.add_argument("--smoke", action="store_true", help="run one start/save/stop smoke test")
     parser.add_argument(
         "--smoke-warmup",
@@ -135,6 +153,9 @@ def main():
     args = parser.parse_args()
 
     skia = SkiaApp()
+    if args.check:
+        raise SystemExit(skia.check())
+
     if args.smoke:
         raise SystemExit(skia.smoke(warmup_seconds=args.smoke_warmup))
 

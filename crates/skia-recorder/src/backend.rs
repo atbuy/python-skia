@@ -1,7 +1,7 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::BackendName;
+use crate::{BackendName, Segment};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfmpegSegmentConfig {
@@ -11,17 +11,24 @@ pub struct FfmpegSegmentConfig {
     pub video_input: String,
     pub audio_input: Option<String>,
     pub segment_pattern: PathBuf,
+    pub segment_list: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum BackendCommandError {
     MissingVideoInput,
+    SegmentList(csv::Error),
+    InvalidSegmentTime(String),
 }
 
 impl fmt::Display for BackendCommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingVideoInput => write!(formatter, "video input is required"),
+            Self::SegmentList(error) => write!(formatter, "{error}"),
+            Self::InvalidSegmentTime(value) => {
+                write!(formatter, "invalid segment timestamp: {value}")
+            }
         }
     }
 }
@@ -140,10 +147,49 @@ fn segment_output_args(config: &FfmpegSegmentConfig) -> Vec<String> {
         "1".to_string(),
         "-segment_format".to_string(),
         "matroska".to_string(),
+        "-segment_list".to_string(),
+        config.segment_list.display().to_string(),
+        "-segment_list_type".to_string(),
+        "csv".to_string(),
         config.segment_pattern.display().to_string(),
     ]);
 
     args
+}
+
+pub fn parse_ffmpeg_segment_list(
+    content: &str,
+    base_dir: &Path,
+) -> Result<Vec<Segment>, BackendCommandError> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(content.as_bytes());
+    let mut segments = Vec::new();
+
+    for record in reader.records() {
+        let record = record.map_err(BackendCommandError::SegmentList)?;
+        if record.len() < 3 {
+            continue;
+        }
+
+        let path = base_dir.join(&record[0]);
+        let start_ms = seconds_to_ms(&record[1])?;
+        let end_ms = seconds_to_ms(&record[2])?;
+
+        if end_ms > start_ms {
+            segments.push(Segment::new(path, start_ms, end_ms));
+        }
+    }
+
+    Ok(segments)
+}
+
+fn seconds_to_ms(value: &str) -> Result<u64, BackendCommandError> {
+    let seconds = value
+        .parse::<f64>()
+        .map_err(|_| BackendCommandError::InvalidSegmentTime(value.to_string()))?;
+
+    Ok((seconds * 1000.0).round() as u64)
 }
 
 #[cfg(test)]
@@ -158,6 +204,7 @@ mod tests {
             video_input: "input".to_string(),
             audio_input: Some("default".to_string()),
             segment_pattern: "/tmp/skia/segment-%06d.mkv".into(),
+            segment_list: "/tmp/skia/segments.csv".into(),
         }
     }
 
@@ -171,6 +218,10 @@ mod tests {
         assert!(args.windows(2).any(|window| window == ["-f", "pipewire"]));
         assert!(args.windows(2).any(|window| window == ["-i", "42"]));
         assert!(args.windows(2).any(|window| window == ["-f", "segment"]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-segment_list", "/tmp/skia/segments.csv"])
+        );
         assert!(args.ends_with(&["/tmp/skia/segment-%06d.mkv".to_string()]));
     }
 
@@ -209,5 +260,22 @@ mod tests {
                 .any(|window| window == ["-f", "avfoundation"])
         );
         assert!(args.windows(2).any(|window| window == ["-i", "1:0"]));
+    }
+
+    #[test]
+    fn parses_ffmpeg_segment_csv_list() {
+        let content = "\
+segment-000000.mkv,0.000000,2.000000\n\
+segment-000001.mkv,2.000000,4.000000\n";
+
+        let segments = parse_ffmpeg_segment_list(content, Path::new("/tmp/skia")).expect("parse");
+
+        assert_eq!(
+            segments,
+            vec![
+                Segment::new("/tmp/skia/segment-000000.mkv", 0, 2000),
+                Segment::new("/tmp/skia/segment-000001.mkv", 2000, 4000),
+            ]
+        );
     }
 }

@@ -38,6 +38,14 @@ impl SegmentRing {
         self.prune()
     }
 
+    pub fn replace(&mut self, segments: impl IntoIterator<Item = Segment>) -> Vec<Segment> {
+        let old_segments: Vec<Segment> = self.segments.drain(..).collect();
+        self.segments.extend(segments);
+        let mut pruned = old_segments;
+        pruned.extend(self.prune());
+        pruned
+    }
+
     pub fn select_last(&self, duration_seconds: u64) -> Vec<Segment> {
         let Some(latest) = self.segments.back() else {
             return Vec::new();
@@ -136,5 +144,19 @@ mod tests {
         let ring = SegmentRing::new(30, 6);
 
         assert!(ring.select_last(30).is_empty());
+    }
+
+    #[test]
+    fn replace_swaps_segments() {
+        let mut ring = SegmentRing::new(30, 6);
+
+        ring.push(Segment::new("segment-0.mkv", 0, 2000));
+        let pruned = ring.replace([Segment::new("segment-1.mkv", 2000, 4000)]);
+
+        assert_eq!(pruned, vec![Segment::new("segment-0.mkv", 0, 2000)]);
+        assert_eq!(
+            ring.select_last(30),
+            vec![Segment::new("segment-1.mkv", 2000, 4000)]
+        );
     }
 }

@@ -8,7 +8,9 @@ mod export;
 mod runtime;
 mod segment;
 
-pub use backend::{BackendCommandError, FfmpegSegmentConfig, ffmpeg_segment_args};
+pub use backend::{
+    BackendCommandError, FfmpegSegmentConfig, ffmpeg_segment_args, parse_ffmpeg_segment_list,
+};
 pub use export::{ExportError, export_clip, ffmpeg_args, write_concat_file};
 pub use runtime::{Platform, RuntimeCheckError, RuntimeChecks, validate_backend};
 pub use segment::{Segment, SegmentRing};

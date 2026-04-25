@@ -61,6 +61,12 @@ Run the app:
 python -m skia.main
 ```
 
+Run a real desktop recording smoke test:
+
+```bash
+python -m skia.main --smoke --smoke-warmup 5
+```
+
 On Wayland, the first start should open the system screen-share picker. Press `ctrl+.` to request a clip. Current Phase 1 behavior depends on your FFmpeg build supporting the selected backend device.
 
 Daemon smoke test:

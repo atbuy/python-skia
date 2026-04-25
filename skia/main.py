@@ -1,3 +1,4 @@
+import argparse
 from datetime import datetime
 from pathlib import Path
 import shutil
@@ -21,16 +22,7 @@ class SkiaApp:
 
     def start(self) -> None:
         print("Starting Skia...")
-        self.recorder.start_process()
-        self.recorder.start_recording(
-            clip_seconds=self.config.clip_seconds,
-            segment_seconds=self.config.segment_seconds,
-            backend=self.config.backend,
-            fps=self.config.fps,
-            cache_dir=self.config.cache_dir,
-            video_input=self.config.video_input,
-            audio_input=self.config.audio_input,
-        )
+        self.start_recorder()
 
         with keyboard.GlobalHotKeys({self.config.hotkey: self.save_clip}) as hotkeys:
             try:
@@ -43,10 +35,60 @@ class SkiaApp:
                 self.recorder.close()
                 print("Stopped Skia.")
 
+    def smoke(self, *, warmup_seconds: float) -> int:
+        print("Starting Skia smoke test...")
+        self.start_recorder()
+        try:
+            if not self._wait_for_event("recording_started", timeout=30):
+                print("Recorder did not start.")
+                return 1
+
+            time.sleep(warmup_seconds)
+            self.save_clip()
+            event = self._wait_for_any_event({"clip_saved", "error"}, timeout=30)
+            if event is None:
+                print("Timed out waiting for clip result.")
+                return 1
+
+            return 0 if event.get("event") == "clip_saved" else 1
+        finally:
+            self.recorder.close()
+            print("Stopped Skia smoke test.")
+
+    def start_recorder(self) -> None:
+        self.recorder.start_process()
+        self.recorder.start_recording(
+            clip_seconds=self.config.clip_seconds,
+            segment_seconds=self.config.segment_seconds,
+            backend=self.config.backend,
+            fps=self.config.fps,
+            cache_dir=self.config.cache_dir,
+            video_input=self.config.video_input,
+            audio_input=self.config.audio_input,
+        )
+
     def save_clip(self) -> None:
         filename = datetime.now().strftime("%Y%m%d-%H%M%S")
         output = self.output_dir.joinpath(f"{filename}.mp4")
         self.recorder.save_last(seconds=self.config.clip_seconds, output=output)
+
+    def _wait_for_event(self, event_type: str, *, timeout: float) -> dict[str, Any] | None:
+        return self._wait_for_any_event({event_type}, timeout=timeout)
+
+    def _wait_for_any_event(
+        self,
+        event_types: set[str],
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            event = self.recorder.wait_for_event(timeout=0.25)
+            if event is None:
+                continue
+            if event.get("event") in event_types:
+                return event
+        return None
 
     def _on_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("event")
@@ -82,7 +124,20 @@ class SkiaApp:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--smoke", action="store_true", help="run one start/save/stop smoke test")
+    parser.add_argument(
+        "--smoke-warmup",
+        type=float,
+        default=5.0,
+        help="seconds to record before saving in smoke mode",
+    )
+    args = parser.parse_args()
+
     skia = SkiaApp()
+    if args.smoke:
+        raise SystemExit(skia.smoke(warmup_seconds=args.smoke_warmup))
+
     skia.start()
 
 

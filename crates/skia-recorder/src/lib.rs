@@ -6,6 +6,7 @@ use thiserror::Error;
 
 mod backend;
 mod export;
+mod portal;
 mod runtime;
 mod segment;
 
@@ -14,6 +15,7 @@ pub use backend::{
     parse_ffmpeg_segment_list,
 };
 pub use export::{ExportError, export_clip, ffmpeg_args, write_concat_file};
+pub use portal::{PortalError, acquire_wayland_pipewire_node};
 pub use runtime::{Platform, RuntimeCheckError, RuntimeChecks, validate_backend};
 pub use segment::{Segment, SegmentRing};
 
@@ -467,9 +469,20 @@ fn ffmpeg_config(
         .video_input
         .clone()
         .or_else(|| default_video_input(backend))
-        .ok_or_else(|| {
-            "Wayland FFmpeg backend requires a PipeWire stream node id; portal acquisition is not implemented yet".to_string()
-        })?;
+        .or_else(|| {
+            if backend == BackendName::LinuxWaylandFfmpeg {
+                match acquire_wayland_pipewire_node() {
+                    Ok(node) => Some(node),
+                    Err(error) => {
+                        tracing::error!(error = %error, "failed to acquire Wayland portal stream");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| "failed to acquire Wayland PipeWire stream node".to_string())?;
 
     Ok(FfmpegSegmentConfig {
         backend,

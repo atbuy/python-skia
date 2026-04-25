@@ -3,10 +3,14 @@ use std::io::{BufRead, Write};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod backend;
 mod export;
+mod runtime;
 mod segment;
 
+pub use backend::{BackendCommandError, FfmpegSegmentConfig, ffmpeg_segment_args};
 pub use export::{ExportError, export_clip, ffmpeg_args, write_concat_file};
+pub use runtime::{Platform, RuntimeCheckError, RuntimeChecks, validate_backend};
 pub use segment::{Segment, SegmentRing};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -111,6 +115,8 @@ pub enum ErrorCode {
     InvalidCommand,
     AlreadyRecording,
     NotRecording,
+    MissingDependency,
+    UnsupportedSession,
     NoSegments,
     ExportUnavailable,
     ExportFailed,
@@ -124,9 +130,9 @@ pub enum ProtocolError {
     Parse(#[from] serde_json::Error),
 }
 
-#[derive(Debug, Default)]
 pub struct RecorderDaemon {
     state: DaemonState,
+    runtime: RuntimeChecks,
 }
 
 #[derive(Debug, Default)]
@@ -138,7 +144,17 @@ struct DaemonState {
 
 impl RecorderDaemon {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            state: DaemonState::default(),
+            runtime: RuntimeChecks::detect(),
+        }
+    }
+
+    pub fn with_runtime(runtime: RuntimeChecks) -> Self {
+        Self {
+            state: DaemonState::default(),
+            runtime,
+        }
     }
 
     pub fn ready_event(&self) -> Event {
@@ -167,7 +183,15 @@ impl RecorderDaemon {
             }];
         }
 
-        let backend = select_backend(config.backend);
+        let backend = select_backend(config.backend, self.runtime);
+        if let Err(error) = validate_backend(backend, self.runtime) {
+            return vec![Event::Error {
+                id: Some(id),
+                code: runtime_error_code(error),
+                message: error.message().to_string(),
+            }];
+        }
+
         self.state.recording = true;
         self.state.backend = Some(backend);
         self.state.segments = Some(SegmentRing::new(config.clip_seconds, 6));
@@ -285,9 +309,18 @@ pub fn run_jsonl(
     Ok(())
 }
 
-fn select_backend(selection: BackendSelection) -> BackendName {
+fn runtime_error_code(error: RuntimeCheckError) -> ErrorCode {
+    match error {
+        RuntimeCheckError::MissingFfmpeg => ErrorCode::MissingDependency,
+        RuntimeCheckError::WaylandUnavailable
+        | RuntimeCheckError::X11Unavailable
+        | RuntimeCheckError::UnsupportedPlatform => ErrorCode::UnsupportedSession,
+    }
+}
+
+fn select_backend(selection: BackendSelection, runtime: RuntimeChecks) -> BackendName {
     match selection {
-        BackendSelection::Auto => auto_backend(),
+        BackendSelection::Auto => auto_backend(runtime),
         BackendSelection::LinuxWaylandFfmpeg => BackendName::LinuxWaylandFfmpeg,
         BackendSelection::LinuxX11Ffmpeg => BackendName::LinuxX11Ffmpeg,
         BackendSelection::WindowsFfmpeg => BackendName::WindowsFfmpeg,
@@ -295,32 +328,26 @@ fn select_backend(selection: BackendSelection) -> BackendName {
     }
 }
 
-fn auto_backend() -> BackendName {
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            return BackendName::LinuxWaylandFfmpeg;
-        }
-        return BackendName::LinuxX11Ffmpeg;
+fn auto_backend(runtime: RuntimeChecks) -> BackendName {
+    match runtime.platform {
+        Platform::Linux if runtime.wayland_display => BackendName::LinuxWaylandFfmpeg,
+        Platform::Linux => BackendName::LinuxX11Ffmpeg,
+        Platform::Windows => BackendName::WindowsFfmpeg,
+        Platform::Macos => BackendName::MacosFfmpeg,
+        Platform::Other => BackendName::LinuxWaylandFfmpeg,
     }
-
-    #[cfg(target_os = "windows")]
-    {
-        return BackendName::WindowsFfmpeg;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        return BackendName::MacosFfmpeg;
-    }
-
-    #[allow(unreachable_code)]
-    BackendName::LinuxWaylandFfmpeg
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_RUNTIME: RuntimeChecks = RuntimeChecks {
+        platform: Platform::Linux,
+        ffmpeg_available: true,
+        wayland_display: true,
+        x11_display: true,
+    };
 
     #[test]
     fn parses_start_command() {
@@ -372,7 +399,7 @@ mod tests {
 
     #[test]
     fn start_changes_status_to_recording() {
-        let mut daemon = RecorderDaemon::new();
+        let mut daemon = RecorderDaemon::with_runtime(TEST_RUNTIME);
 
         daemon.handle_command(Command::Start {
             id: "start-1".to_string(),
@@ -399,7 +426,7 @@ mod tests {
 
     #[test]
     fn save_last_before_segments_returns_structured_error() {
-        let mut daemon = RecorderDaemon::new();
+        let mut daemon = RecorderDaemon::with_runtime(TEST_RUNTIME);
         daemon.handle_command(Command::Start {
             id: "start-1".to_string(),
             config: StartConfig {
@@ -422,6 +449,54 @@ mod tests {
                 code: ErrorCode::NoSegments,
                 message: "no recorded segments are available yet".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn start_returns_error_when_ffmpeg_is_missing() {
+        let mut daemon = RecorderDaemon::with_runtime(RuntimeChecks {
+            ffmpeg_available: false,
+            ..TEST_RUNTIME
+        });
+
+        let events = daemon.handle_command(Command::Start {
+            id: "start-1".to_string(),
+            config: StartConfig {
+                clip_seconds: 30,
+                segment_seconds: 2,
+                backend: BackendSelection::LinuxWaylandFfmpeg,
+            },
+        });
+
+        assert_eq!(
+            events,
+            vec![Event::Error {
+                id: Some("start-1".to_string()),
+                code: ErrorCode::MissingDependency,
+                message: "ffmpeg is not installed or not available on PATH".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn auto_backend_prefers_wayland_on_linux_when_available() {
+        assert_eq!(
+            select_backend(BackendSelection::Auto, TEST_RUNTIME),
+            BackendName::LinuxWaylandFfmpeg
+        );
+    }
+
+    #[test]
+    fn auto_backend_falls_back_to_x11_on_linux_without_wayland() {
+        let runtime = RuntimeChecks {
+            wayland_display: false,
+            x11_display: true,
+            ..TEST_RUNTIME
+        };
+
+        assert_eq!(
+            select_backend(BackendSelection::Auto, runtime),
+            BackendName::LinuxX11Ffmpeg
         );
     }
 

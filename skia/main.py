@@ -26,6 +26,10 @@ class SkiaApp:
             clip_seconds=self.config.clip_seconds,
             segment_seconds=self.config.segment_seconds,
             backend=self.config.backend,
+            fps=self.config.fps,
+            cache_dir=self.config.cache_dir,
+            video_input=self.config.video_input,
+            audio_input=self.config.audio_input,
         )
 
         with keyboard.GlobalHotKeys({self.config.hotkey: self.save_clip}) as hotkeys:

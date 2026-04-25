@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 
 use crate::{BackendName, Segment};
 
@@ -17,6 +18,7 @@ pub struct FfmpegSegmentConfig {
 #[derive(Debug)]
 pub enum BackendCommandError {
     MissingVideoInput,
+    Spawn(std::io::Error),
     SegmentList(csv::Error),
     InvalidSegmentTime(String),
 }
@@ -25,6 +27,7 @@ impl fmt::Display for BackendCommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingVideoInput => write!(formatter, "video input is required"),
+            Self::Spawn(error) => write!(formatter, "failed to start ffmpeg: {error}"),
             Self::SegmentList(error) => write!(formatter, "{error}"),
             Self::InvalidSegmentTime(value) => {
                 write!(formatter, "invalid segment timestamp: {value}")
@@ -34,6 +37,41 @@ impl fmt::Display for BackendCommandError {
 }
 
 impl std::error::Error for BackendCommandError {}
+
+#[derive(Debug)]
+pub struct RecorderProcess {
+    child: Child,
+}
+
+impl RecorderProcess {
+    pub fn start(config: &FfmpegSegmentConfig) -> Result<Self, BackendCommandError> {
+        let args = ffmpeg_segment_args(config)?;
+        let child = Command::new("ffmpeg")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(BackendCommandError::Spawn)?;
+
+        Ok(Self { child })
+    }
+
+    pub fn stop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for RecorderProcess {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 pub fn ffmpeg_segment_args(
     config: &FfmpegSegmentConfig,

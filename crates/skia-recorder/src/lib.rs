@@ -10,7 +10,8 @@ mod runtime;
 mod segment;
 
 pub use backend::{
-    BackendCommandError, FfmpegSegmentConfig, ffmpeg_segment_args, parse_ffmpeg_segment_list,
+    BackendCommandError, FfmpegSegmentConfig, RecorderProcess, ffmpeg_segment_args,
+    parse_ffmpeg_segment_list,
 };
 pub use export::{ExportError, export_clip, ffmpeg_args, write_concat_file};
 pub use runtime::{Platform, RuntimeCheckError, RuntimeChecks, validate_backend};
@@ -63,7 +64,7 @@ pub struct StartConfig {
     pub audio_input: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendSelection {
     Auto,
@@ -129,6 +130,7 @@ pub enum ErrorCode {
     MissingDependency,
     UnsupportedSession,
     CacheUnavailable,
+    BackendStartFailed,
     SegmentRefreshFailed,
     NoSegments,
     ExportUnavailable,
@@ -146,6 +148,7 @@ pub enum ProtocolError {
 pub struct RecorderDaemon {
     state: DaemonState,
     runtime: RuntimeChecks,
+    processes_enabled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -155,6 +158,7 @@ struct DaemonState {
     segments: Option<SegmentRing>,
     cache_dir: Option<PathBuf>,
     segment_list: Option<PathBuf>,
+    process: Option<RecorderProcess>,
 }
 
 impl RecorderDaemon {
@@ -162,6 +166,7 @@ impl RecorderDaemon {
         Self {
             state: DaemonState::default(),
             runtime: RuntimeChecks::detect(),
+            processes_enabled: true,
         }
     }
 
@@ -169,6 +174,7 @@ impl RecorderDaemon {
         Self {
             state: DaemonState::default(),
             runtime,
+            processes_enabled: false,
         }
     }
 
@@ -209,6 +215,7 @@ impl RecorderDaemon {
 
         let cache_dir = config
             .cache_dir
+            .clone()
             .map(PathBuf::from)
             .unwrap_or_else(default_cache_dir);
         if let Err(error) = std::fs::create_dir_all(&cache_dir) {
@@ -219,11 +226,41 @@ impl RecorderDaemon {
             }];
         }
 
+        let segment_list = cache_dir.join("segments.csv");
+        let segment_pattern = cache_dir.join("segment-%06d.mkv");
+        let process = if self.processes_enabled {
+            let ffmpeg_config =
+                match ffmpeg_config(backend, &config, &segment_pattern, &segment_list) {
+                    Ok(config) => config,
+                    Err(message) => {
+                        return vec![Event::Error {
+                            id: Some(id),
+                            code: ErrorCode::BackendStartFailed,
+                            message,
+                        }];
+                    }
+                };
+
+            match RecorderProcess::start(&ffmpeg_config) {
+                Ok(process) => Some(process),
+                Err(error) => {
+                    return vec![Event::Error {
+                        id: Some(id),
+                        code: ErrorCode::BackendStartFailed,
+                        message: error.to_string(),
+                    }];
+                }
+            }
+        } else {
+            None
+        };
+
         self.state.recording = true;
         self.state.backend = Some(backend);
         self.state.segments = Some(SegmentRing::new(config.clip_seconds, 6));
-        self.state.segment_list = Some(cache_dir.join("segments.csv"));
+        self.state.segment_list = Some(segment_list);
         self.state.cache_dir = Some(cache_dir);
+        self.state.process = process;
 
         vec![Event::RecordingStarted { id, backend }]
     }
@@ -294,11 +331,16 @@ impl RecorderDaemon {
     }
 
     fn stop(&mut self, id: String) -> Vec<Event> {
+        if let Some(process) = self.state.process.as_mut() {
+            process.stop();
+        }
+
         self.state.recording = false;
         self.state.backend = None;
         self.state.segments = None;
         self.state.cache_dir = None;
         self.state.segment_list = None;
+        self.state.process = None;
         vec![Event::Stopped { id }]
     }
 
@@ -413,6 +455,42 @@ fn auto_backend(runtime: RuntimeChecks) -> BackendName {
 
 fn default_cache_dir() -> PathBuf {
     std::env::temp_dir().join("skia-recorder")
+}
+
+fn ffmpeg_config(
+    backend: BackendName,
+    config: &StartConfig,
+    segment_pattern: &Path,
+    segment_list: &Path,
+) -> Result<FfmpegSegmentConfig, String> {
+    let video_input = config
+        .video_input
+        .clone()
+        .or_else(|| default_video_input(backend))
+        .ok_or_else(|| {
+            "Wayland FFmpeg backend requires a PipeWire stream node id; portal acquisition is not implemented yet".to_string()
+        })?;
+
+    Ok(FfmpegSegmentConfig {
+        backend,
+        fps: config.fps.unwrap_or(60),
+        segment_seconds: config.segment_seconds,
+        video_input,
+        audio_input: config.audio_input.clone(),
+        segment_pattern: segment_pattern.to_path_buf(),
+        segment_list: segment_list.to_path_buf(),
+    })
+}
+
+fn default_video_input(backend: BackendName) -> Option<String> {
+    match backend {
+        BackendName::LinuxWaylandFfmpeg => None,
+        BackendName::LinuxX11Ffmpeg => {
+            Some(std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".to_string()))
+        }
+        BackendName::WindowsFfmpeg => Some("desktop".to_string()),
+        BackendName::MacosFfmpeg => Some("1".to_string()),
+    }
 }
 
 #[cfg(test)]

@@ -51,14 +51,27 @@ class RecorderClient:
         clip_seconds: int = 30,
         segment_seconds: int = 2,
         backend: str = "auto",
+        fps: int = 60,
+        cache_dir: Path | None = None,
+        video_input: str | None = None,
+        audio_input: str | None = None,
     ) -> str:
+        config: dict[str, Any] = {
+            "clip_seconds": clip_seconds,
+            "segment_seconds": segment_seconds,
+            "backend": backend,
+            "fps": fps,
+        }
+        if cache_dir is not None:
+            config["cache_dir"] = str(cache_dir)
+        if video_input is not None:
+            config["video_input"] = video_input
+        if audio_input is not None:
+            config["audio_input"] = audio_input
+
         return self.send(
             "start",
-            config={
-                "clip_seconds": clip_seconds,
-                "segment_seconds": segment_seconds,
-                "backend": backend,
-            },
+            config=config,
         )
 
     def save_last(self, *, seconds: int, output: Path) -> str:

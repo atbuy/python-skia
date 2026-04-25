@@ -47,6 +47,14 @@ Run the local FFmpeg smoke test:
 cargo test -p skia-recorder --test ffmpeg_smoke -- --ignored
 ```
 
+Run platform capture smoke tests on matching systems:
+
+```bash
+cargo test -p skia-recorder --test backend_smoke x11_ffmpeg_capture_smoke -- --ignored
+cargo test -p skia-recorder --test backend_smoke windows_gdigrab_capture_smoke -- --ignored
+cargo test -p skia-recorder --test backend_smoke macos_avfoundation_capture_smoke -- --ignored
+```
+
 Run the app:
 
 ```bash

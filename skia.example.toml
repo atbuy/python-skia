@@ -1,0 +1,16 @@
+[recording]
+clip_seconds = 30
+segment_seconds = 2
+backend = "auto"
+fps = 60
+cache_dir = ".cache/skia"
+
+# Optional overrides.
+# Wayland normally gets video_input from XDG Desktop Portal.
+# X11 can use ":0.0"; Windows can use "desktop"; macOS can use "1".
+# video_input = ":0.0"
+# audio_input = "default"
+
+[app]
+hotkey = "<ctrl>+."
+output_dir = "out"

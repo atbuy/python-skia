@@ -1,5 +1,7 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -254,7 +256,23 @@ impl RecorderDaemon {
                 };
 
             match RecorderProcess::start(&ffmpeg_config) {
-                Ok(process) => Some(process),
+                Ok(mut process) => {
+                    thread::sleep(Duration::from_millis(250));
+                    if process.has_exited() {
+                        let stderr = process.stderr_summary();
+                        let message = if stderr.is_empty() {
+                            "ffmpeg backend exited immediately".to_string()
+                        } else {
+                            format!("ffmpeg backend exited immediately: {stderr}")
+                        };
+                        return vec![Event::Error {
+                            id: Some(id),
+                            code: ErrorCode::BackendStartFailed,
+                            message,
+                        }];
+                    }
+                    Some(process)
+                }
                 Err(error) => {
                     return vec![Event::Error {
                         id: Some(id),
@@ -287,11 +305,12 @@ impl RecorderDaemon {
         }
 
         if self.recorder_process_exited() {
+            let message = self.recorder_exited_message();
             self.clear_recording_state();
             return vec![Event::Error {
                 id: Some(id),
                 code: ErrorCode::RecorderExited,
-                message: "recorder backend process exited unexpectedly".to_string(),
+                message,
             }];
         }
 
@@ -314,7 +333,7 @@ impl RecorderDaemon {
             return vec![Event::Error {
                 id: Some(id),
                 code: ErrorCode::NoSegments,
-                message: "no recorded segments are available yet".to_string(),
+                message: "no completed recorded segments are available yet; wait at least one segment duration and verify the backend is producing media".to_string(),
             }];
         }
 
@@ -341,11 +360,12 @@ impl RecorderDaemon {
 
     fn status(&mut self, id: String) -> Vec<Event> {
         if self.recorder_process_exited() {
+            let message = self.recorder_exited_message();
             self.clear_recording_state();
             return vec![Event::Error {
                 id: Some(id),
                 code: ErrorCode::RecorderExited,
-                message: "recorder backend process exited unexpectedly".to_string(),
+                message,
             }];
         }
 
@@ -390,6 +410,21 @@ impl RecorderDaemon {
             .process
             .as_mut()
             .is_some_and(RecorderProcess::has_exited)
+    }
+
+    fn recorder_exited_message(&self) -> String {
+        let stderr = self
+            .state
+            .process
+            .as_ref()
+            .map(RecorderProcess::stderr_summary)
+            .unwrap_or_default();
+
+        if stderr.is_empty() {
+            "recorder backend process exited unexpectedly".to_string()
+        } else {
+            format!("recorder backend process exited unexpectedly: {stderr}")
+        }
     }
 
     fn refresh_segments(&mut self) -> Result<(), String> {
@@ -680,7 +715,7 @@ mod tests {
             vec![Event::Error {
                 id: Some("save-1".to_string()),
                 code: ErrorCode::NoSegments,
-                message: "no recorded segments are available yet".to_string(),
+                message: "no completed recorded segments are available yet; wait at least one segment duration and verify the backend is producing media".to_string(),
             }]
         );
     }

@@ -2,6 +2,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::{BackendName, Segment};
@@ -43,6 +44,7 @@ impl std::error::Error for BackendCommandError {}
 #[derive(Debug)]
 pub struct RecorderProcess {
     child: Child,
+    stderr_tail: Arc<Mutex<Vec<String>>>,
 }
 
 impl RecorderProcess {
@@ -56,19 +58,34 @@ impl RecorderProcess {
             .spawn()
             .map_err(BackendCommandError::Spawn)?;
 
+        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
         if let Some(stderr) = child.stderr.take() {
+            let stderr_tail = Arc::clone(&stderr_tail);
             thread::spawn(move || {
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if let Ok(mut tail) = stderr_tail.lock() {
+                        tail.push(line.clone());
+                        if tail.len() > 8 {
+                            tail.remove(0);
+                        }
+                    }
                     tracing::error!(target: "skia_recorder::ffmpeg", "{line}");
                 }
             });
         }
 
-        Ok(Self { child })
+        Ok(Self { child, stderr_tail })
     }
 
     pub fn has_exited(&mut self) -> bool {
         self.child.try_wait().ok().flatten().is_some()
+    }
+
+    pub fn stderr_summary(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| tail.join("\n"))
+            .unwrap_or_default()
     }
 
     pub fn stop(&mut self) {

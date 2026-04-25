@@ -41,6 +41,12 @@ Build and test the Rust daemon:
 cargo test -p skia-recorder
 ```
 
+Run the local FFmpeg smoke test:
+
+```bash
+cargo test -p skia-recorder --test ffmpeg_smoke -- --ignored
+```
+
 Run the app:
 
 ```bash

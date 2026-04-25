@@ -39,8 +39,11 @@ class SkiaApp:
         print("Starting Skia smoke test...")
         self.start_recorder()
         try:
-            if not self._wait_for_event("recording_started", timeout=30):
+            start_event = self._wait_for_any_event({"recording_started", "error"}, timeout=30)
+            if start_event is None:
                 print("Recorder did not start.")
+                return 1
+            if start_event.get("event") == "error":
                 return 1
 
             time.sleep(warmup_seconds)

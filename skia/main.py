@@ -1,126 +1,78 @@
-import os
-import time
 from datetime import datetime
 from pathlib import Path
-from threading import Thread
+import shutil
+import subprocess
+import time
+from typing import Any
 
-import blosc2
-import imageio
-import numpy as np
-from mss import mss
 from pynput import keyboard
-from pynput.keyboard import Key, KeyCode
+
+from skia.recorder_client import RecorderClient
 
 
-class Skia:
+class SkiaApp:
     def __init__(self):
-        self.width = 1920
-        self.height = 1080
-        self.size = (self.width, self.height)
+        self.root = Path(__file__).resolve().parent.parent
+        self.output_dir = self.root.joinpath("out")
+        self.output_dir.mkdir(exist_ok=True)
+        self.recorder = RecorderClient(on_event=self._on_event, on_log=self._on_log)
 
-        self.framerate = 60
-        self._mean_framerate = self.framerate
-        self.video_length = 30
+    def start(self) -> None:
+        print("Starting Skia...")
+        self.recorder.start_process()
+        self.recorder.start_recording()
 
-        self.buffer = np.array([None] * self.framerate * self.video_length)
-        self.index = 0
-        self.length = len(self.buffer)
+        with keyboard.GlobalHotKeys({"<ctrl>+.": self.save_clip}) as hotkeys:
+            try:
+                while True:
+                    time.sleep(0.25)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                hotkeys.stop()
+                self.recorder.close()
+                print("Stopped Skia.")
 
-    def _on_press(self, key: Key | KeyCode | None):
-        if key is None or not isinstance(key, KeyCode):
+    def save_clip(self) -> None:
+        filename = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output = self.output_dir.joinpath(f"{filename}.mp4")
+        self.recorder.save_last(seconds=30, output=output)
+
+    def _on_event(self, event: dict[str, Any]) -> None:
+        event_type = event.get("event")
+        if event_type == "ready":
+            print(f"Recorder ready: {event.get('version')}")
+        elif event_type == "recording_started":
+            print(f"Recording with backend: {event.get('backend')}")
+        elif event_type == "clip_saved":
+            path = str(event.get("path"))
+            print(f"Clip saved: {path}")
+            self._notify("Skia", f"Clip saved: {path}")
+        elif event_type == "error":
+            message = str(event.get("message", "unknown recorder error"))
+            print(f"Recorder error: {message}")
+            self._notify("Skia", message)
+        else:
+            print(f"Recorder event: {event}")
+
+    def _on_log(self, line: str) -> None:
+        if line:
+            print(f"recorder: {line}")
+
+    def _notify(self, title: str, message: str) -> None:
+        if shutil.which("notify-send") is None:
             return
 
-        # F13 is pressed
-        if key.vk == 269025153:
-            self._save()
-
-    def _save(self):
-        buffer = self.buffer.copy()
-
-        th = Thread(target=self._store_buffer, args=(buffer,))
-        th.start()
-
-    def _store_buffer(self, buffer):
-        """Store clip to specified path."""
-
-        self._store_buffer_imageio(buffer)
-
-        # Send notification after the file has been stored
-        os.system("notify-send 'Skia' 'Stored clip'")
-
-    def _store_buffer_imageio(self, buffer):
-        """Store clip to specified path, using imageio."""
-
-        filename = datetime.now().isoformat()
-        outpath = Path(__file__).parent.parent.joinpath("out", f"{filename}.mp4")
-
-        framerate = self._mean_total_frames // self._mean_counter
-        writer = imageio.get_writer(outpath, fps=framerate)
-
-        for compressed in buffer:
-            if compressed is None:
-                break
-
-            decompressed = blosc2.unpack_array(compressed)
-            writer.append_data(decompressed.astype("uint8"))
-
-        writer.close()
-
-    def start(self):
-        """Start loop to store images."""
-
-        print("Started loop...")
-
-        sct = mss()
-        monitor = sct.monitors[2]
-
-        listener = keyboard.Listener(on_press=self._on_press)
-        listener.start()
-
-        try:
-            prev = time.perf_counter()
-            fps = 0
-
-            self._mean_counter = 0
-            self._mean_total_frames = 0
-
-            while True:
-                if (time.perf_counter() - prev) >= 1:
-                    prev = time.perf_counter()
-                    self._mean_counter += 1
-                    self._mean_total_frames += fps
-                    fps = 0
-                else:
-                    if fps >= self.framerate:
-                        time.sleep(0.001)
-                        continue
-
-                screen = sct.grab(monitor)
-                fps += 1
-
-                # Convert screenshot to numpy array and convert from BGRA to RGB
-                array = np.array(screen, dtype=np.uint8)
-                array = np.flip(array[:, :, :3], 2)
-
-                # Compress array and store it
-                self.buffer[self.index] = blosc2.pack_array(array)
-
-                self.index += 1
-
-                if self.index == self.length:
-                    self.index = self.length - 1
-                    self.buffer = np.roll(self.buffer, -1)
-
-        except KeyboardInterrupt:
-            pass
-
-        listener.stop()
-
-        print("Stopped loop...")
+        subprocess.run(
+            ["notify-send", title, message],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 def main():
-    skia = Skia()
+    skia = SkiaApp()
     skia.start()
 
 

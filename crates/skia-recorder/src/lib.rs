@@ -428,7 +428,9 @@ pub fn run_jsonl(
 
 fn runtime_error_code(error: RuntimeCheckError) -> ErrorCode {
     match error {
-        RuntimeCheckError::MissingFfmpeg => ErrorCode::MissingDependency,
+        RuntimeCheckError::MissingFfmpeg | RuntimeCheckError::MissingFfmpegDevice(_) => {
+            ErrorCode::MissingDependency
+        }
         RuntimeCheckError::WaylandUnavailable
         | RuntimeCheckError::X11Unavailable
         | RuntimeCheckError::UnsupportedPlatform => ErrorCode::UnsupportedSession,
@@ -513,6 +515,11 @@ mod tests {
     const TEST_RUNTIME: RuntimeChecks = RuntimeChecks {
         platform: Platform::Linux,
         ffmpeg_available: true,
+        ffmpeg_pipewire: true,
+        ffmpeg_x11grab: true,
+        ffmpeg_gdigrab: true,
+        ffmpeg_dshow: true,
+        ffmpeg_avfoundation: true,
         wayland_display: true,
         x11_display: true,
     };

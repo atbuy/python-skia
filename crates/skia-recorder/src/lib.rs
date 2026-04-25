@@ -133,6 +133,7 @@ pub enum ErrorCode {
     UnsupportedSession,
     CacheUnavailable,
     BackendStartFailed,
+    RecorderExited,
     SegmentRefreshFailed,
     NoSegments,
     ExportUnavailable,
@@ -192,7 +193,7 @@ impl RecorderDaemon {
                 seconds,
                 output,
             } => self.save_last(id, seconds, output),
-            Command::Status { id } => vec![self.status(id)],
+            Command::Status { id } => self.status(id),
             Command::Stop { id } => self.stop(id),
         }
     }
@@ -276,6 +277,15 @@ impl RecorderDaemon {
             }];
         }
 
+        if self.recorder_process_exited() {
+            self.clear_recording_state();
+            return vec![Event::Error {
+                id: Some(id),
+                code: ErrorCode::RecorderExited,
+                message: "recorder backend process exited unexpectedly".to_string(),
+            }];
+        }
+
         if let Err(error) = self.refresh_segments() {
             return vec![Event::Error {
                 id: Some(id),
@@ -320,8 +330,17 @@ impl RecorderDaemon {
         }
     }
 
-    fn status(&self, id: String) -> Event {
-        Event::Status {
+    fn status(&mut self, id: String) -> Vec<Event> {
+        if self.recorder_process_exited() {
+            self.clear_recording_state();
+            return vec![Event::Error {
+                id: Some(id),
+                code: ErrorCode::RecorderExited,
+                message: "recorder backend process exited unexpectedly".to_string(),
+            }];
+        }
+
+        vec![Event::Status {
             id,
             state: if self.state.recording {
                 RecorderState::Recording
@@ -329,7 +348,7 @@ impl RecorderDaemon {
                 RecorderState::Idle
             },
             backend: self.state.backend,
-        }
+        }]
     }
 
     fn stop(&mut self, id: String) -> Vec<Event> {
@@ -337,13 +356,24 @@ impl RecorderDaemon {
             process.stop();
         }
 
+        self.clear_recording_state();
+        vec![Event::Stopped { id }]
+    }
+
+    fn clear_recording_state(&mut self) {
         self.state.recording = false;
         self.state.backend = None;
         self.state.segments = None;
         self.state.cache_dir = None;
         self.state.segment_list = None;
         self.state.process = None;
-        vec![Event::Stopped { id }]
+    }
+
+    fn recorder_process_exited(&mut self) -> bool {
+        self.state
+            .process
+            .as_mut()
+            .is_some_and(RecorderProcess::has_exited)
     }
 
     fn refresh_segments(&mut self) -> Result<(), String> {

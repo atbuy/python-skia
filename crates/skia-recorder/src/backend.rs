@@ -1,6 +1,8 @@
 use std::fmt;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread;
 
 use crate::{BackendName, Segment};
 
@@ -46,7 +48,7 @@ pub struct RecorderProcess {
 impl RecorderProcess {
     pub fn start(config: &FfmpegSegmentConfig) -> Result<Self, BackendCommandError> {
         let args = ffmpeg_segment_args(config)?;
-        let child = Command::new("ffmpeg")
+        let mut child = Command::new("ffmpeg")
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -54,11 +56,23 @@ impl RecorderProcess {
             .spawn()
             .map_err(BackendCommandError::Spawn)?;
 
+        if let Some(stderr) = child.stderr.take() {
+            thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    tracing::error!(target: "skia_recorder::ffmpeg", "{line}");
+                }
+            });
+        }
+
         Ok(Self { child })
     }
 
+    pub fn has_exited(&mut self) -> bool {
+        self.child.try_wait().ok().flatten().is_some()
+    }
+
     pub fn stop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_some() {
+        if self.has_exited() {
             return;
         }
 

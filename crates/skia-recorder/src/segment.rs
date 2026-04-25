@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -39,9 +40,19 @@ impl SegmentRing {
     }
 
     pub fn replace(&mut self, segments: impl IntoIterator<Item = Segment>) -> Vec<Segment> {
-        let old_segments: Vec<Segment> = self.segments.drain(..).collect();
-        self.segments.extend(segments);
-        let mut pruned = old_segments;
+        let old_segments: Vec<Segment> = self.segments.iter().cloned().collect();
+        let new_segments: Vec<Segment> = segments.into_iter().collect();
+        let new_paths: HashSet<PathBuf> = new_segments
+            .iter()
+            .map(|segment| segment.path.clone())
+            .collect();
+        let mut pruned: Vec<Segment> = old_segments
+            .into_iter()
+            .filter(|segment| !new_paths.contains(&segment.path))
+            .collect();
+
+        self.segments.clear();
+        self.segments.extend(new_segments);
         pruned.extend(self.prune());
         pruned
     }

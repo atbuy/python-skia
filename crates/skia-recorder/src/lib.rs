@@ -1,4 +1,5 @@
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -52,6 +53,14 @@ pub struct StartConfig {
     pub clip_seconds: u64,
     pub segment_seconds: u64,
     pub backend: BackendSelection,
+    #[serde(default)]
+    pub cache_dir: Option<String>,
+    #[serde(default)]
+    pub fps: Option<u32>,
+    #[serde(default)]
+    pub video_input: Option<String>,
+    #[serde(default)]
+    pub audio_input: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +128,8 @@ pub enum ErrorCode {
     NotRecording,
     MissingDependency,
     UnsupportedSession,
+    CacheUnavailable,
+    SegmentRefreshFailed,
     NoSegments,
     ExportUnavailable,
     ExportFailed,
@@ -142,6 +153,8 @@ struct DaemonState {
     recording: bool,
     backend: Option<BackendName>,
     segments: Option<SegmentRing>,
+    cache_dir: Option<PathBuf>,
+    segment_list: Option<PathBuf>,
 }
 
 impl RecorderDaemon {
@@ -194,19 +207,41 @@ impl RecorderDaemon {
             }];
         }
 
+        let cache_dir = config
+            .cache_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(default_cache_dir);
+        if let Err(error) = std::fs::create_dir_all(&cache_dir) {
+            return vec![Event::Error {
+                id: Some(id),
+                code: ErrorCode::CacheUnavailable,
+                message: format!("failed to create cache directory: {error}"),
+            }];
+        }
+
         self.state.recording = true;
         self.state.backend = Some(backend);
         self.state.segments = Some(SegmentRing::new(config.clip_seconds, 6));
+        self.state.segment_list = Some(cache_dir.join("segments.csv"));
+        self.state.cache_dir = Some(cache_dir);
 
         vec![Event::RecordingStarted { id, backend }]
     }
 
-    fn save_last(&self, id: String, seconds: u64, output: String) -> Vec<Event> {
+    fn save_last(&mut self, id: String, seconds: u64, output: String) -> Vec<Event> {
         if !self.state.recording {
             return vec![Event::Error {
                 id: Some(id),
                 code: ErrorCode::NotRecording,
                 message: "recorder is not running".to_string(),
+            }];
+        }
+
+        if let Err(error) = self.refresh_segments() {
+            return vec![Event::Error {
+                id: Some(id),
+                code: ErrorCode::SegmentRefreshFailed,
+                message: error,
             }];
         }
 
@@ -232,7 +267,7 @@ impl RecorderDaemon {
             "exporting clip"
         );
 
-        match export_clip(&segments, std::path::Path::new(&output)) {
+        match export_clip(&segments, Path::new(&output)) {
             Ok(()) => vec![Event::ClipSaved {
                 id,
                 path: output,
@@ -262,7 +297,43 @@ impl RecorderDaemon {
         self.state.recording = false;
         self.state.backend = None;
         self.state.segments = None;
+        self.state.cache_dir = None;
+        self.state.segment_list = None;
         vec![Event::Stopped { id }]
+    }
+
+    fn refresh_segments(&mut self) -> Result<(), String> {
+        let Some(segment_list) = self.state.segment_list.as_ref() else {
+            return Ok(());
+        };
+        if !segment_list.exists() {
+            return Ok(());
+        }
+
+        let Some(cache_dir) = self.state.cache_dir.as_ref() else {
+            return Ok(());
+        };
+
+        let content = std::fs::read_to_string(segment_list)
+            .map_err(|error| format!("failed to read segment list: {error}"))?;
+        let segments = parse_ffmpeg_segment_list(&content, cache_dir)
+            .map_err(|error| format!("failed to parse segment list: {error}"))?;
+
+        if let Some(ring) = self.state.segments.as_mut() {
+            for segment in ring.replace(segments) {
+                if let Err(error) = std::fs::remove_file(&segment.path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            path = %segment.path.display(),
+                            error = %error,
+                            "failed to remove pruned segment"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -340,6 +411,10 @@ fn auto_backend(runtime: RuntimeChecks) -> BackendName {
     }
 }
 
+fn default_cache_dir() -> PathBuf {
+    std::env::temp_dir().join("skia-recorder")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +441,10 @@ mod tests {
                     clip_seconds: 30,
                     segment_seconds: 2,
                     backend: BackendSelection::Auto,
+                    cache_dir: None,
+                    fps: None,
+                    video_input: None,
+                    audio_input: None,
                 },
             }
         );
@@ -409,6 +488,10 @@ mod tests {
                 clip_seconds: 30,
                 segment_seconds: 2,
                 backend: BackendSelection::LinuxWaylandFfmpeg,
+                cache_dir: None,
+                fps: None,
+                video_input: None,
+                audio_input: None,
             },
         });
 
@@ -435,6 +518,10 @@ mod tests {
                 clip_seconds: 30,
                 segment_seconds: 2,
                 backend: BackendSelection::LinuxWaylandFfmpeg,
+                cache_dir: None,
+                fps: None,
+                video_input: None,
+                audio_input: None,
             },
         });
 
@@ -467,6 +554,10 @@ mod tests {
                 clip_seconds: 30,
                 segment_seconds: 2,
                 backend: BackendSelection::LinuxWaylandFfmpeg,
+                cache_dir: None,
+                fps: None,
+                video_input: None,
+                audio_input: None,
             },
         });
 
@@ -478,6 +569,48 @@ mod tests {
                 message: "ffmpeg is not installed or not available on PATH".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn refresh_segments_reads_ffmpeg_segment_list() {
+        let cache_dir =
+            std::env::temp_dir().join(format!("skia-refresh-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+        std::fs::write(
+            cache_dir.join("segments.csv"),
+            "segment-000000.mkv,0.000000,2.000000\n",
+        )
+        .expect("write segment list");
+
+        let mut daemon = RecorderDaemon::with_runtime(TEST_RUNTIME);
+        daemon.handle_command(Command::Start {
+            id: "start-1".to_string(),
+            config: StartConfig {
+                clip_seconds: 30,
+                segment_seconds: 2,
+                backend: BackendSelection::LinuxWaylandFfmpeg,
+                cache_dir: Some(cache_dir.display().to_string()),
+                fps: None,
+                video_input: None,
+                audio_input: None,
+            },
+        });
+
+        daemon.refresh_segments().expect("refresh segments");
+        let selected = daemon
+            .state
+            .segments
+            .as_ref()
+            .expect("ring")
+            .select_last(30);
+
+        assert_eq!(
+            selected,
+            vec![Segment::new(cache_dir.join("segment-000000.mkv"), 0, 2000)]
+        );
+
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]

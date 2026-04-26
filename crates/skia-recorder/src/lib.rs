@@ -257,6 +257,16 @@ impl RecorderDaemon {
             return error_event(id, runtime_error_code(error), error.message());
         }
 
+        if backend == BackendName::LinuxWaylandFfmpeg && config.video_input.is_none() {
+            return error_event(
+                id,
+                ErrorCode::UnsupportedSession,
+                "ffmpeg's pipewire input cannot consume the XDG desktop portal \
+                 PipeWire fd; set recording.video_input to a known PipeWire \
+                 node id, or use the linux-wayland-gstreamer backend",
+            );
+        }
+
         let cache_dir = config
             .cache_dir
             .clone()
@@ -352,10 +362,9 @@ impl RecorderDaemon {
         if config.video_input.is_some() {
             return Ok(None);
         }
-        let needs_portal = matches!(
-            backend,
-            BackendName::LinuxWaylandFfmpeg | BackendName::LinuxWaylandGstreamer
-        );
+        // Only gstreamer can use a portal-provided PipeWire fd; ffmpeg's
+        // pipewire input always connects to the default core.
+        let needs_portal = matches!(backend, BackendName::LinuxWaylandGstreamer);
         if !needs_portal {
             return Ok(None);
         }
@@ -741,10 +750,14 @@ fn select_backend(selection: BackendSelection, runtime: RuntimeChecks) -> Backen
 fn auto_backend(runtime: RuntimeChecks) -> BackendName {
     match runtime.platform {
         Platform::Linux if runtime.wayland_display => {
-            if runtime.ffmpeg_pipewire {
-                BackendName::LinuxWaylandFfmpeg
-            } else {
+            // Prefer gstreamer on Wayland: only its `pipewiresrc` element can
+            // consume the XDG portal's PipeWire remote fd. ffmpeg's libavdevice
+            // pipewire input always connects to the user's default core and
+            // therefore cannot see portal-private nodes.
+            if runtime.gstreamer_available && runtime.gstreamer_pipewiresrc {
                 BackendName::LinuxWaylandGstreamer
+            } else {
+                BackendName::LinuxWaylandFfmpeg
             }
         }
         Platform::Linux => BackendName::LinuxX11Ffmpeg,
@@ -932,7 +945,7 @@ mod tests {
                 backend: BackendSelection::LinuxWaylandFfmpeg,
                 cache_dir: None,
                 fps: None,
-                video_input: None,
+                video_input: Some("42".to_string()),
                 audio_input: None,
                 gstreamer: GstreamerQualityConfig::default(),
             },
@@ -963,7 +976,7 @@ mod tests {
                 backend: BackendSelection::LinuxWaylandFfmpeg,
                 cache_dir: None,
                 fps: None,
-                video_input: None,
+                video_input: Some("42".to_string()),
                 audio_input: None,
                 gstreamer: GstreamerQualityConfig::default(),
             },
@@ -1037,7 +1050,7 @@ mod tests {
                 backend: BackendSelection::LinuxWaylandFfmpeg,
                 cache_dir: Some(cache_dir.display().to_string()),
                 fps: None,
-                video_input: None,
+                video_input: Some("42".to_string()),
                 audio_input: None,
                 gstreamer: GstreamerQualityConfig::default(),
             },
@@ -1060,11 +1073,52 @@ mod tests {
     }
 
     #[test]
-    fn auto_backend_prefers_wayland_on_linux_when_available() {
+    fn auto_backend_prefers_gstreamer_on_wayland_when_available() {
         assert_eq!(
             select_backend(BackendSelection::Auto, TEST_RUNTIME),
+            BackendName::LinuxWaylandGstreamer
+        );
+    }
+
+    #[test]
+    fn auto_backend_falls_back_to_ffmpeg_wayland_without_gstreamer() {
+        let runtime = RuntimeChecks {
+            gstreamer_available: false,
+            gstreamer_pipewiresrc: false,
+            ..TEST_RUNTIME
+        };
+
+        assert_eq!(
+            select_backend(BackendSelection::Auto, runtime),
             BackendName::LinuxWaylandFfmpeg
         );
+    }
+
+    #[test]
+    fn linux_wayland_ffmpeg_refused_without_video_input() {
+        let mut daemon = RecorderDaemon::with_runtime(TEST_RUNTIME);
+
+        let events = daemon.handle_command(Command::Start {
+            id: "start-1".to_string(),
+            config: StartConfig {
+                clip_seconds: 30,
+                segment_seconds: 2,
+                backend: BackendSelection::LinuxWaylandFfmpeg,
+                cache_dir: None,
+                fps: None,
+                video_input: None,
+                audio_input: None,
+                gstreamer: GstreamerQualityConfig::default(),
+            },
+        });
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Error {
+                code: ErrorCode::UnsupportedSession,
+                ..
+            }]
+        ));
     }
 
     #[test]

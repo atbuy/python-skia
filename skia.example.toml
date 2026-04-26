@@ -22,3 +22,12 @@ cache_dir = ".cache/skia"
 [app]
 hotkey = "<ctrl>+."
 output_dir = "out"
+
+# Optional gstreamer quality knobs. Leaving these unset keeps the built-in
+# defaults (CRF-style quantizer=20 + medium preset for x264, 20 Mbps VBR for
+# NVENC/VAAPI, 160 kbps Opus audio).
+# [gstreamer]
+# bitrate_kbps = 20000        # NVENC / VAAPI target bitrate (kbps)
+# quantizer = 20              # x264 CRF-style quantizer (0-51, lower = better)
+# x264_preset = "medium"      # x264 speed-preset (e.g. veryfast, fast, medium, slow)
+# audio_bitrate_bps = 160000  # Opus audio bitrate (bits per second)

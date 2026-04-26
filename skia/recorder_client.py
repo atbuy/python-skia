@@ -58,6 +58,7 @@ class RecorderClient:
         cache_dir: Path | None = None,
         video_input: str | None = None,
         audio_input: str | None = None,
+        gstreamer: dict[str, Any] | None = None,
     ) -> str:
         config: dict[str, Any] = {
             "clip_seconds": clip_seconds,
@@ -71,6 +72,8 @@ class RecorderClient:
             config["video_input"] = video_input
         if audio_input is not None:
             config["audio_input"] = audio_input
+        if gstreamer:
+            config["gstreamer"] = gstreamer
 
         return self.send(
             "start",

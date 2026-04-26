@@ -45,6 +45,15 @@ pub struct GstreamerSegmentConfig {
     pub segment_seconds: u64,
     pub segment_pattern: PathBuf,
     pub video_encoder: GstreamerVideoEncoder,
+    /// Target bitrate (kbps) for hardware encoders (NVENC, VAAPI). Software
+    /// x264 ignores this and uses `quantizer` instead.
+    pub bitrate_kbps: u32,
+    /// CRF-style quantizer (0-51) for software x264. Lower = higher quality.
+    pub quantizer: u32,
+    /// `speed-preset` value passed to `x264enc` (e.g. `medium`, `fast`).
+    pub x264_preset: String,
+    /// Opus audio bitrate (bps).
+    pub audio_bitrate_bps: u32,
 }
 
 #[derive(Debug)]
@@ -358,9 +367,9 @@ pub fn gstreamer_segment_args(
         GstreamerVideoEncoder::X264 => {
             args.extend([
                 "x264enc".to_string(),
-                "speed-preset=medium".to_string(),
+                format!("speed-preset={}", config.x264_preset),
                 "pass=qual".to_string(),
-                "quantizer=20".to_string(),
+                format!("quantizer={}", config.quantizer),
                 format!("key-int-max={}", key_int_max),
             ]);
         }
@@ -369,7 +378,7 @@ pub fn gstreamer_segment_args(
                 "nvh264enc".to_string(),
                 "preset=hq".to_string(),
                 "rc-mode=vbr-hq".to_string(),
-                "bitrate=20000".to_string(),
+                format!("bitrate={}", config.bitrate_kbps),
                 format!("gop-size={}", key_int_max),
             ]);
         }
@@ -377,7 +386,7 @@ pub fn gstreamer_segment_args(
             args.extend([
                 "vah264enc".to_string(),
                 "rate-control=vbr".to_string(),
-                "bitrate=20000".to_string(),
+                format!("bitrate={}", config.bitrate_kbps),
                 format!("key-int-max={}", key_int_max),
             ]);
         }
@@ -385,7 +394,7 @@ pub fn gstreamer_segment_args(
             args.extend([
                 "vaapih264enc".to_string(),
                 "rate-control=vbr".to_string(),
-                "bitrate=20000".to_string(),
+                format!("bitrate={}", config.bitrate_kbps),
                 format!("keyframe-period={}", key_int_max),
             ]);
         }
@@ -405,7 +414,7 @@ pub fn gstreamer_segment_args(
             "audioresample".to_string(),
             "!".to_string(),
             "opusenc".to_string(),
-            "bitrate=160000".to_string(),
+            format!("bitrate={}", config.audio_bitrate_bps),
             "!".to_string(),
             "mux.audio_0".to_string(),
         ]);
@@ -593,6 +602,10 @@ segment-000001.mkv,2.000000,4.000000\n";
             segment_seconds: 2,
             segment_pattern: "/tmp/skia/segment-%06d.mkv".into(),
             video_encoder: GstreamerVideoEncoder::X264,
+            bitrate_kbps: 20_000,
+            quantizer: 20,
+            x264_preset: "medium".to_string(),
+            audio_bitrate_bps: 160_000,
         }
     }
 
@@ -688,6 +701,50 @@ segment-000001.mkv,2.000000,4.000000\n";
         assert!(args.iter().any(|arg| arg == "bitrate=20000"));
         assert!(args.iter().any(|arg| arg == "gop-size=120"));
         assert!(!args.iter().any(|arg| arg == "x264enc"));
+    }
+
+    #[test]
+    fn applies_quality_overrides_to_x264_args() {
+        let mut config = gst_config();
+        config.quantizer = 18;
+        config.x264_preset = "veryfast".to_string();
+
+        let args = gstreamer_segment_args(&config).expect("args");
+
+        assert!(args.iter().any(|arg| arg == "speed-preset=veryfast"));
+        assert!(args.iter().any(|arg| arg == "quantizer=18"));
+    }
+
+    #[test]
+    fn applies_bitrate_override_to_hardware_encoders() {
+        for encoder in [
+            GstreamerVideoEncoder::Nvh264,
+            GstreamerVideoEncoder::Vah264,
+            GstreamerVideoEncoder::Vaapih264,
+        ] {
+            let mut config = gst_config();
+            config.video_encoder = encoder;
+            config.bitrate_kbps = 8_000;
+
+            let args = gstreamer_segment_args(&config).expect("args");
+            assert!(
+                args.iter().any(|arg| arg == "bitrate=8000"),
+                "expected bitrate=8000 for {:?}, got {:?}",
+                encoder,
+                args
+            );
+        }
+    }
+
+    #[test]
+    fn applies_audio_bitrate_override() {
+        let mut config = gst_config();
+        config.audio_input = Some("source".to_string());
+        config.audio_bitrate_bps = 96_000;
+
+        let args = gstreamer_segment_args(&config).expect("args");
+
+        assert!(args.iter().any(|arg| arg == "bitrate=96000"));
     }
 
     #[test]

@@ -15,6 +15,14 @@ DEFAULT_FPS = 60
 
 
 @dataclass(frozen=True)
+class GstreamerQualityConfig:
+    bitrate_kbps: int | None
+    quantizer: int | None
+    x264_preset: str | None
+    audio_bitrate_bps: int | None
+
+
+@dataclass(frozen=True)
 class SkiaConfig:
     clip_seconds: int
     segment_seconds: int
@@ -25,6 +33,7 @@ class SkiaConfig:
     audio_input: str | None
     hotkey: str
     output_dir: Path
+    gstreamer: GstreamerQualityConfig
 
 
 def load_config(
@@ -39,6 +48,7 @@ def load_config(
 
     recording = data.get("recording", {})
     app = data.get("app", {})
+    gstreamer = data.get("gstreamer", {})
 
     clip_seconds = _positive_int(
         recording.get("clip_seconds", DEFAULT_CLIP_SECONDS),
@@ -56,6 +66,17 @@ def load_config(
     hotkey = str(app.get("hotkey", DEFAULT_HOTKEY))
     output_dir = _resolve_path(root, app.get("output_dir", DEFAULT_OUTPUT_DIR))
 
+    gstreamer_config = GstreamerQualityConfig(
+        bitrate_kbps=_optional_positive_int(
+            gstreamer.get("bitrate_kbps"), "gstreamer.bitrate_kbps"
+        ),
+        quantizer=_optional_quantizer(gstreamer.get("quantizer")),
+        x264_preset=_optional_str(gstreamer.get("x264_preset")),
+        audio_bitrate_bps=_optional_positive_int(
+            gstreamer.get("audio_bitrate_bps"), "gstreamer.audio_bitrate_bps"
+        ),
+    )
+
     return SkiaConfig(
         clip_seconds=clip_seconds,
         segment_seconds=segment_seconds,
@@ -66,6 +87,7 @@ def load_config(
         audio_input=audio_input,
         hotkey=hotkey,
         output_dir=output_dir,
+        gstreamer=gstreamer_config,
     )
 
 
@@ -110,3 +132,17 @@ def _optional_str(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _optional_positive_int(value: object, key: str) -> int | None:
+    if value is None:
+        return None
+    return _positive_int(value, key)
+
+
+def _optional_quantizer(value: object) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or value < 0 or value > 51:
+        raise ValueError("gstreamer.quantizer must be an integer in [0, 51]")
+    return value

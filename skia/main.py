@@ -95,6 +95,17 @@ class SkiaApp:
             if audio_input is not None:
                 print(f"Auto-detected audio source: {audio_input}")
 
+        gstreamer_overrides: dict[str, Any] = {}
+        gst = self.config.gstreamer
+        if gst.bitrate_kbps is not None:
+            gstreamer_overrides["bitrate_kbps"] = gst.bitrate_kbps
+        if gst.quantizer is not None:
+            gstreamer_overrides["quantizer"] = gst.quantizer
+        if gst.x264_preset is not None:
+            gstreamer_overrides["x264_preset"] = gst.x264_preset
+        if gst.audio_bitrate_bps is not None:
+            gstreamer_overrides["audio_bitrate_bps"] = gst.audio_bitrate_bps
+
         self.recorder.start_process()
         self.recorder.start_recording(
             clip_seconds=self.config.clip_seconds,
@@ -104,6 +115,7 @@ class SkiaApp:
             cache_dir=self.config.cache_dir,
             video_input=self.config.video_input,
             audio_input=audio_input,
+            gstreamer=gstreamer_overrides or None,
         )
 
     def save_clip(self) -> None:

@@ -71,7 +71,26 @@ pub struct StartConfig {
     pub video_input: Option<String>,
     #[serde(default)]
     pub audio_input: Option<String>,
+    #[serde(default)]
+    pub gstreamer: GstreamerQualityConfig,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct GstreamerQualityConfig {
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
+    #[serde(default)]
+    pub quantizer: Option<u32>,
+    #[serde(default)]
+    pub x264_preset: Option<String>,
+    #[serde(default)]
+    pub audio_bitrate_bps: Option<u32>,
+}
+
+const DEFAULT_BITRATE_KBPS: u32 = 20_000;
+const DEFAULT_QUANTIZER: u32 = 20;
+const DEFAULT_X264_PRESET: &str = "medium";
+const DEFAULT_AUDIO_BITRATE_BPS: u32 = 160_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -806,6 +825,20 @@ fn gstreamer_config(
         segment_seconds: config.segment_seconds,
         segment_pattern: segment_pattern.to_path_buf(),
         video_encoder,
+        bitrate_kbps: config
+            .gstreamer
+            .bitrate_kbps
+            .unwrap_or(DEFAULT_BITRATE_KBPS),
+        quantizer: config.gstreamer.quantizer.unwrap_or(DEFAULT_QUANTIZER),
+        x264_preset: config
+            .gstreamer
+            .x264_preset
+            .clone()
+            .unwrap_or_else(|| DEFAULT_X264_PRESET.to_string()),
+        audio_bitrate_bps: config
+            .gstreamer
+            .audio_bitrate_bps
+            .unwrap_or(DEFAULT_AUDIO_BITRATE_BPS),
     })
 }
 
@@ -853,6 +886,7 @@ mod tests {
                     fps: None,
                     video_input: None,
                     audio_input: None,
+                    gstreamer: GstreamerQualityConfig::default(),
                 },
             }
         );
@@ -900,6 +934,7 @@ mod tests {
                 fps: None,
                 video_input: None,
                 audio_input: None,
+                gstreamer: GstreamerQualityConfig::default(),
             },
         });
 
@@ -930,6 +965,7 @@ mod tests {
                 fps: None,
                 video_input: None,
                 audio_input: None,
+                gstreamer: GstreamerQualityConfig::default(),
             },
         });
 
@@ -966,6 +1002,7 @@ mod tests {
                 fps: None,
                 video_input: None,
                 audio_input: None,
+                gstreamer: GstreamerQualityConfig::default(),
             },
         });
 
@@ -1002,6 +1039,7 @@ mod tests {
                 fps: None,
                 video_input: None,
                 audio_input: None,
+                gstreamer: GstreamerQualityConfig::default(),
             },
         });
 
@@ -1092,6 +1130,7 @@ mod tests {
                 fps: Some(30),
                 video_input: Some("99".to_string()),
                 audio_input: None,
+                gstreamer: GstreamerQualityConfig::default(),
             },
         });
 
@@ -1134,6 +1173,7 @@ mod tests {
                 fps: None,
                 video_input: Some("99".to_string()),
                 audio_input: None,
+                gstreamer: GstreamerQualityConfig::default(),
             },
         });
 
@@ -1182,6 +1222,7 @@ mod tests {
                 fps: None,
                 video_input: None,
                 audio_input: None,
+                gstreamer: GstreamerQualityConfig::default(),
             },
         });
 

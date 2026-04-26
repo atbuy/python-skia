@@ -20,6 +20,10 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(config.audio_input)
         self.assertEqual(config.hotkey, "<ctrl>+.")
         self.assertEqual(config.output_dir, root / "out")
+        self.assertIsNone(config.gstreamer.bitrate_kbps)
+        self.assertIsNone(config.gstreamer.quantizer)
+        self.assertIsNone(config.gstreamer.x264_preset)
+        self.assertIsNone(config.gstreamer.audio_bitrate_bps)
 
     def test_loads_project_config(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -64,6 +68,36 @@ class ConfigTests(unittest.TestCase):
             config = load_config(root=root, env={"SKIA_CONFIG": str(config_path)})
 
         self.assertEqual(config.clip_seconds, 15)
+
+    def test_loads_gstreamer_quality_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.joinpath("skia.toml").write_text(
+                "\n".join(
+                    [
+                        "[gstreamer]",
+                        "bitrate_kbps = 8000",
+                        "quantizer = 18",
+                        'x264_preset = "fast"',
+                        "audio_bitrate_bps = 96000",
+                    ]
+                )
+            )
+
+            config = load_config(root=root, env={})
+
+        self.assertEqual(config.gstreamer.bitrate_kbps, 8000)
+        self.assertEqual(config.gstreamer.quantizer, 18)
+        self.assertEqual(config.gstreamer.x264_preset, "fast")
+        self.assertEqual(config.gstreamer.audio_bitrate_bps, 96000)
+
+    def test_rejects_quantizer_out_of_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.joinpath("skia.toml").write_text("[gstreamer]\nquantizer = 60\n")
+
+            with self.assertRaisesRegex(ValueError, "gstreamer.quantizer"):
+                load_config(root=root, env={})
 
     def test_rejects_invalid_positive_ints(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -194,6 +194,16 @@ struct DaemonState {
     segment_source: Option<SegmentSource>,
     process: Option<RecorderProcess>,
     portal_session: Option<PortalSession>,
+    /// Snapshot of the spawn config so we can restart the pipeline after a
+    /// flush_and_stop without re-acquiring the portal session.
+    restart_spec: Option<RestartSpec>,
+    clip_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+enum RestartSpec {
+    Gstreamer(GstreamerSegmentConfig),
+    Ffmpeg(FfmpegSegmentConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -301,42 +311,53 @@ impl RecorderDaemon {
         #[cfg(not(unix))]
         let portal_fd: Option<i32> = None;
 
-        let (segment_source, process) = match backend {
+        let (segment_source, restart_spec, process) = match backend {
             BackendName::LinuxWaylandGstreamer => {
-                let source = SegmentSource::GstreamerScan {
-                    cache_dir: cache_dir.clone(),
-                    segment_seconds: config.segment_seconds,
-                };
-                let process = match self.spawn_gstreamer(
-                    &id,
+                let gst_cfg = match gstreamer_config(
                     &config,
                     &segment_pattern,
                     portal_node,
                     portal_fd,
+                    self.runtime,
                 ) {
+                    Ok(cfg) => cfg,
+                    Err(message) => {
+                        return error_event(id, ErrorCode::BackendStartFailed, message);
+                    }
+                };
+                let source = SegmentSource::GstreamerScan {
+                    cache_dir: cache_dir.clone(),
+                    segment_seconds: config.segment_seconds,
+                };
+                let process = match self.spawn_gstreamer_from_config(&id, &gst_cfg) {
                     Ok(process) => process,
                     Err(events) => return events,
                 };
-                (source, process)
+                (source, RestartSpec::Gstreamer(gst_cfg), process)
             }
             _ => {
                 let segment_list = cache_dir.join("segments.csv");
-                let source = SegmentSource::FfmpegCsv {
-                    list: segment_list.clone(),
-                    cache_dir: cache_dir.clone(),
-                };
-                let process = match self.spawn_ffmpeg(
-                    &id,
+                let ffmpeg_cfg = match ffmpeg_config(
                     backend,
                     &config,
                     &segment_pattern,
                     &segment_list,
                     portal_node,
                 ) {
+                    Ok(cfg) => cfg,
+                    Err(message) => {
+                        return error_event(id, ErrorCode::BackendStartFailed, message);
+                    }
+                };
+                let source = SegmentSource::FfmpegCsv {
+                    list: segment_list.clone(),
+                    cache_dir: cache_dir.clone(),
+                };
+                let process = match self.spawn_ffmpeg_from_config(&id, &ffmpeg_cfg) {
                     Ok(process) => process,
                     Err(events) => return events,
                 };
-                (source, process)
+                (source, RestartSpec::Ffmpeg(ffmpeg_cfg), process)
             }
         };
 
@@ -346,6 +367,8 @@ impl RecorderDaemon {
         self.state.segment_source = Some(segment_source);
         self.state.process = process;
         self.state.portal_session = portal_session;
+        self.state.restart_spec = Some(restart_spec);
+        self.state.clip_seconds = config.clip_seconds;
 
         vec![Event::RecordingStarted { id, backend }]
     }
@@ -382,25 +405,16 @@ impl RecorderDaemon {
         }
     }
 
-    fn spawn_ffmpeg(
+    fn spawn_ffmpeg_from_config(
         &self,
         id: &str,
-        backend: BackendName,
-        config: &StartConfig,
-        segment_pattern: &Path,
-        segment_list: &Path,
-        portal_node: Option<&str>,
+        ffmpeg_config: &FfmpegSegmentConfig,
     ) -> Result<Option<RecorderProcess>, Vec<Event>> {
         if !self.processes_enabled {
             return Ok(None);
         }
 
-        let ffmpeg_config =
-            ffmpeg_config(backend, config, segment_pattern, segment_list, portal_node).map_err(
-                |message| error_event(id.to_string(), ErrorCode::BackendStartFailed, message),
-            )?;
-
-        let mut process = RecorderProcess::start_ffmpeg(&ffmpeg_config).map_err(|error| {
+        let mut process = RecorderProcess::start_ffmpeg(ffmpeg_config).map_err(|error| {
             error_event(
                 id.to_string(),
                 ErrorCode::BackendStartFailed,
@@ -426,28 +440,16 @@ impl RecorderDaemon {
         Ok(Some(process))
     }
 
-    fn spawn_gstreamer(
+    fn spawn_gstreamer_from_config(
         &self,
         id: &str,
-        config: &StartConfig,
-        segment_pattern: &Path,
-        portal_node: Option<&str>,
-        portal_fd: Option<i32>,
+        gst_config: &GstreamerSegmentConfig,
     ) -> Result<Option<RecorderProcess>, Vec<Event>> {
         if !self.processes_enabled {
             return Ok(None);
         }
 
-        let gst_config = gstreamer_config(
-            config,
-            segment_pattern,
-            portal_node,
-            portal_fd,
-            self.runtime,
-        )
-        .map_err(|message| error_event(id.to_string(), ErrorCode::BackendStartFailed, message))?;
-
-        let mut process = RecorderProcess::start_gstreamer(&gst_config).map_err(|error| {
+        let mut process = RecorderProcess::start_gstreamer(gst_config).map_err(|error| {
             error_event(
                 id.to_string(),
                 ErrorCode::BackendStartFailed,
@@ -492,7 +494,17 @@ impl RecorderDaemon {
             }];
         }
 
-        if let Err(error) = self.refresh_segments() {
+        // Drain the running pipeline so the in-progress segment gets a valid
+        // matroska tail and ends up in the segment list. Without this the clip
+        // would be missing the last `segment_seconds` seconds before the press.
+        if let Some(process) = self.state.process.as_mut() {
+            process.flush_and_stop(Duration::from_secs(3));
+        }
+        self.state.process = None;
+
+        // After the flush the previously-tail segment is closed, so we keep
+        // every entry on disk instead of dropping the last one.
+        if let Err(error) = self.refresh_segments_with(false) {
             return vec![Event::Error {
                 id: Some(id),
                 code: ErrorCode::SegmentRefreshFailed,
@@ -508,6 +520,9 @@ impl RecorderDaemon {
             .unwrap_or_default();
 
         if segments.is_empty() {
+            // Nothing to export, but still try to restart so the next press
+            // catches subsequent footage.
+            self.restart_after_flush();
             return vec![Event::Error {
                 id: Some(id),
                 code: ErrorCode::NoSegments,
@@ -522,17 +537,90 @@ impl RecorderDaemon {
             "exporting clip"
         );
 
-        match export_clip(&segments, Path::new(&output)) {
-            Ok(()) => vec![Event::ClipSaved {
-                id,
-                path: output,
-                duration_seconds: seconds,
-            }],
+        let export_result = export_clip(&segments, Path::new(&output));
+
+        // Restart the pipeline whether or not the export succeeded; the user
+        // expects recording to continue after the keypress.
+        let restart_failure = self.restart_after_flush();
+
+        match export_result {
+            Ok(()) => {
+                let mut events = vec![Event::ClipSaved {
+                    id: id.clone(),
+                    path: output,
+                    duration_seconds: seconds,
+                }];
+                if let Some(message) = restart_failure {
+                    events.push(Event::Error {
+                        id: Some(id),
+                        code: ErrorCode::BackendStartFailed,
+                        message,
+                    });
+                }
+                events
+            }
             Err(error) => vec![Event::Error {
                 id: Some(id),
                 code: ErrorCode::ExportFailed,
                 message: error.to_string(),
             }],
+        }
+    }
+
+    /// Reset the cache directory and respawn the recorder pipeline using the
+    /// stashed restart spec. Returns `Some(message)` if the restart failed so
+    /// the caller can surface it to the client.
+    fn restart_after_flush(&mut self) -> Option<String> {
+        let Some(spec) = self.state.restart_spec.clone() else {
+            return None;
+        };
+
+        let cache_dir = match &spec {
+            RestartSpec::Gstreamer(c) => c.segment_pattern.parent().map(Path::to_path_buf),
+            RestartSpec::Ffmpeg(c) => c.segment_pattern.parent().map(Path::to_path_buf),
+        };
+
+        if let Some(dir) = cache_dir.as_ref() {
+            if let Err(error) = clean_segment_files(dir) {
+                tracing::warn!(error = %error, "failed to clear cache before restart");
+            }
+        }
+
+        // Reset segment ring + bookkeeping that the new pipeline will refill.
+        if let Some(ring) = self.state.segments.as_mut() {
+            ring.replace(Vec::new());
+        } else {
+            self.state.segments = Some(SegmentRing::new(self.state.clip_seconds, 6));
+        }
+
+        if !self.processes_enabled {
+            return None;
+        }
+
+        let result = match &spec {
+            RestartSpec::Gstreamer(cfg) => self.spawn_gstreamer_from_config("__restart__", cfg),
+            RestartSpec::Ffmpeg(cfg) => self.spawn_ffmpeg_from_config("__restart__", cfg),
+        };
+
+        match result {
+            Ok(Some(process)) => {
+                self.state.process = Some(process);
+                None
+            }
+            Ok(None) => None,
+            Err(events) => {
+                // We couldn't restart — drop the recording state so subsequent
+                // commands surface NotRecording instead of stale state.
+                let message = events
+                    .into_iter()
+                    .find_map(|event| match event {
+                        Event::Error { message, .. } => Some(message),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "failed to restart recorder pipeline".to_string());
+                self.clear_recording_state();
+                Some(message)
+            }
         }
     }
 
@@ -580,6 +668,8 @@ impl RecorderDaemon {
         self.state.segments = None;
         self.state.segment_source = None;
         self.state.process = None;
+        self.state.restart_spec = None;
+        self.state.clip_seconds = 0;
         // Drop the portal session AFTER the recorder process has been torn
         // down so the PipeWire stream stays alive while gst/ffmpeg is still
         // shutting down.
@@ -608,7 +698,7 @@ impl RecorderDaemon {
         }
     }
 
-    fn refresh_segments(&mut self) -> Result<(), String> {
+    fn refresh_segments_with(&mut self, drop_tail: bool) -> Result<(), String> {
         let Some(source) = self.state.segment_source.as_ref() else {
             return Ok(());
         };
@@ -626,7 +716,7 @@ impl RecorderDaemon {
             SegmentSource::GstreamerScan {
                 cache_dir,
                 segment_seconds,
-            } => scan_gstreamer_segments(cache_dir, *segment_seconds)
+            } => scan_gstreamer_segments(cache_dir, *segment_seconds, drop_tail)
                 .map_err(|error| format!("failed to scan segments: {error}"))?,
         };
 
@@ -1056,7 +1146,9 @@ mod tests {
             },
         });
 
-        daemon.refresh_segments().expect("refresh segments");
+        daemon
+            .refresh_segments_with(true)
+            .expect("refresh segments");
         let selected = daemon
             .state
             .segments
@@ -1239,7 +1331,9 @@ mod tests {
             .expect("write segment");
         }
 
-        daemon.refresh_segments().expect("refresh segments");
+        daemon
+            .refresh_segments_with(true)
+            .expect("refresh segments");
         let selected = daemon
             .state
             .segments

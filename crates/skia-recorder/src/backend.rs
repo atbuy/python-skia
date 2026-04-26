@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::{BackendName, Segment};
 
@@ -190,6 +191,49 @@ impl RecorderProcess {
     pub fn stop(&mut self) {
         if self.has_exited() {
             return;
+        }
+
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Ask the backend to drain cleanly: send SIGINT (Unix) or SIGTERM-equivalent
+    /// (Windows) so it can finalize the in-progress segment, then wait up to
+    /// `timeout` for it to exit. Falls back to `kill` if the timeout elapses.
+    /// Both `gst-launch-1.0 -e` and `ffmpeg` flush the muxer on SIGINT, which
+    /// closes the matroska tail of the running segment so it becomes safe to
+    /// concat.
+    pub fn flush_and_stop(&mut self, timeout: Duration) {
+        if self.has_exited() {
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            let pid = self.child.id() as i32;
+            // SAFETY: kill() with a non-negative pid and a documented signal
+            // number is safe; the worst case is ESRCH if the child already
+            // exited, which we handle below by polling try_wait().
+            unsafe {
+                libc::kill(pid, libc::SIGINT);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
         }
 
         let _ = self.child.kill();
@@ -426,6 +470,7 @@ pub fn gstreamer_segment_args(
 pub fn scan_gstreamer_segments(
     cache_dir: &Path,
     segment_seconds: u64,
+    drop_tail: bool,
 ) -> Result<Vec<Segment>, BackendCommandError> {
     let read = match std::fs::read_dir(cache_dir) {
         Ok(read) => read,
@@ -446,9 +491,13 @@ pub fn scan_gstreamer_segments(
     }
 
     entries.sort_by_key(|(index, _)| *index);
-    // The highest-indexed file is the one splitmuxsink is currently writing.
-    // Exclude it: it may be missing the matroska tail and is unsafe to concat.
-    entries.pop();
+    if drop_tail {
+        // While the recorder is running, the highest-indexed file is the one
+        // splitmuxsink is currently writing — it may be missing the matroska
+        // tail and is unsafe to concat. After a flush_and_stop the tail is
+        // closed so the caller can pass `drop_tail = false` to keep it.
+        entries.pop();
+    }
 
     if segment_seconds == 0 {
         return Ok(Vec::new());
@@ -792,13 +841,41 @@ segment-000001.mkv,2.000000,4.000000\n";
         }
         std::fs::write(cache_dir.join("notes.txt"), b"ignored").expect("write extra");
 
-        let segments = scan_gstreamer_segments(&cache_dir, 2).expect("scan");
+        let segments = scan_gstreamer_segments(&cache_dir, 2, true).expect("scan");
 
         assert_eq!(
             segments,
             vec![
                 Segment::new(cache_dir.join("segment-000000.mkv"), 0, 2000),
                 Segment::new(cache_dir.join("segment-000001.mkv"), 2000, 4000),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn scan_gstreamer_segments_keeps_tail_after_flush() {
+        let cache_dir =
+            std::env::temp_dir().join(format!("skia-scan-test-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+        for index in 0..3 {
+            std::fs::write(
+                cache_dir.join(format!("segment-{index:06}.mkv")),
+                b"placeholder",
+            )
+            .expect("write segment");
+        }
+
+        let segments = scan_gstreamer_segments(&cache_dir, 2, false).expect("scan");
+
+        assert_eq!(
+            segments,
+            vec![
+                Segment::new(cache_dir.join("segment-000000.mkv"), 0, 2000),
+                Segment::new(cache_dir.join("segment-000001.mkv"), 2000, 4000),
+                Segment::new(cache_dir.join("segment-000002.mkv"), 4000, 6000),
             ]
         );
 
@@ -813,7 +890,7 @@ segment-000001.mkv,2.000000,4.000000\n";
         std::fs::create_dir_all(&cache_dir).expect("create cache dir");
         std::fs::write(cache_dir.join("segment-000000.mkv"), b"x").expect("write");
 
-        let segments = scan_gstreamer_segments(&cache_dir, 2).expect("scan");
+        let segments = scan_gstreamer_segments(&cache_dir, 2, true).expect("scan");
         assert!(segments.is_empty());
 
         let _ = std::fs::remove_dir_all(cache_dir);
@@ -825,7 +902,7 @@ segment-000001.mkv,2.000000,4.000000\n";
             std::env::temp_dir().join(format!("skia-scan-test-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache_dir);
 
-        let segments = scan_gstreamer_segments(&cache_dir, 2).expect("scan");
+        let segments = scan_gstreamer_segments(&cache_dir, 2, true).expect("scan");
         assert!(segments.is_empty());
     }
 }

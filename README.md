@@ -8,14 +8,30 @@ Phase 1 uses Python as the control app and a Rust recorder daemon for capture, s
 
 - Python from the active pyenv environment
 - Rust/Cargo
-- FFmpeg
+- FFmpeg (recording with `linux-wayland-ffmpeg`, `linux-x11-ffmpeg`, `windows-ffmpeg`, `macos-ffmpeg`; required by all backends for clip export)
 - Linux Wayland: `pipewire`, `xdg-desktop-portal`, and a desktop portal backend such as `xdg-desktop-portal-gtk`, `xdg-desktop-portal-gnome`, or `xdg-desktop-portal-kde`
+- Linux Wayland with `linux-wayland-gstreamer`: also `gst-launch-1.0`, `gst-plugin-pipewire`, `gst-plugins-base` (videoconvert), `gst-plugins-good` (splitmuxsink, matroskamux), `gst-plugins-ugly` (x264enc)
 - Linux X11: FFmpeg with `x11grab`
+
+On Arch Linux:
+
+```bash
+sudo pacman -S pipewire wireplumber xdg-desktop-portal \
+  gst-plugin-pipewire gstreamer gst-plugins-base \
+  gst-plugins-good gst-plugins-ugly gst-libav
+sudo pacman -S xdg-desktop-portal-gtk  # or xdg-desktop-portal-gnome / -kde
+```
 
 Check FFmpeg capture devices:
 
 ```bash
 ffmpeg -hide_banner -devices
+```
+
+Check GStreamer elements (for `linux-wayland-gstreamer`):
+
+```bash
+gst-inspect-1.0 pipewiresrc videoconvert x264enc matroskamux splitmuxsink
 ```
 
 ## Configuration
@@ -24,7 +40,7 @@ Copy `skia.example.toml` to `skia.toml` and edit values as needed. Defaults are 
 
 Important fields:
 
-- `recording.backend`: `auto`, `linux-wayland-ffmpeg`, `linux-x11-ffmpeg`, `windows-ffmpeg`, or `macos-ffmpeg`
+- `recording.backend`: `auto`, `linux-wayland-ffmpeg`, `linux-wayland-gstreamer`, `linux-x11-ffmpeg`, `windows-ffmpeg`, or `macos-ffmpeg`. On Wayland, `auto` falls back to `linux-wayland-gstreamer` when FFmpeg lacks the `pipewire` input device
 - `recording.clip_seconds`: clip length saved by the hotkey
 - `recording.segment_seconds`: internal segment duration
 - `recording.cache_dir`: temporary segment cache

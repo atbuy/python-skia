@@ -13,11 +13,12 @@ mod runtime;
 mod segment;
 
 pub use backend::{
-    BackendCommandError, FfmpegSegmentConfig, RecorderProcess, ffmpeg_segment_args,
-    parse_ffmpeg_segment_list,
+    BackendCommandError, FfmpegSegmentConfig, GstreamerSegmentConfig, RecorderProcess,
+    ffmpeg_segment_args, gstreamer_segment_args, parse_ffmpeg_segment_list,
+    scan_gstreamer_segments,
 };
 pub use export::{ExportError, export_clip, ffmpeg_args, write_concat_file};
-pub use portal::{PortalError, acquire_wayland_pipewire_node};
+pub use portal::{PortalError, PortalSession};
 pub use runtime::{Platform, RuntimeCheckError, RuntimeChecks, validate_backend};
 pub use segment::{Segment, SegmentRing};
 
@@ -77,6 +78,7 @@ pub struct StartConfig {
 pub enum BackendSelection {
     Auto,
     LinuxWaylandFfmpeg,
+    LinuxWaylandGstreamer,
     LinuxX11Ffmpeg,
     WindowsFfmpeg,
     MacosFfmpeg,
@@ -128,6 +130,7 @@ pub enum RecorderState {
 #[serde(rename_all = "kebab-case")]
 pub enum BackendName {
     LinuxWaylandFfmpeg,
+    LinuxWaylandGstreamer,
     LinuxX11Ffmpeg,
     WindowsFfmpeg,
     MacosFfmpeg,
@@ -169,9 +172,21 @@ struct DaemonState {
     recording: bool,
     backend: Option<BackendName>,
     segments: Option<SegmentRing>,
-    cache_dir: Option<PathBuf>,
-    segment_list: Option<PathBuf>,
+    segment_source: Option<SegmentSource>,
     process: Option<RecorderProcess>,
+    portal_session: Option<PortalSession>,
+}
+
+#[derive(Debug, Clone)]
+enum SegmentSource {
+    FfmpegCsv {
+        list: PathBuf,
+        cache_dir: PathBuf,
+    },
+    GstreamerScan {
+        cache_dir: PathBuf,
+        segment_seconds: u64,
+    },
 }
 
 impl RecorderDaemon {
@@ -211,20 +226,16 @@ impl RecorderDaemon {
 
     fn start(&mut self, id: String, config: StartConfig) -> Vec<Event> {
         if self.state.recording {
-            return vec![Event::Error {
-                id: Some(id),
-                code: ErrorCode::AlreadyRecording,
-                message: "recorder is already running".to_string(),
-            }];
+            return error_event(
+                id,
+                ErrorCode::AlreadyRecording,
+                "recorder is already running",
+            );
         }
 
         let backend = select_backend(config.backend, self.runtime);
         if let Err(error) = validate_backend(backend, self.runtime) {
-            return vec![Event::Error {
-                id: Some(id),
-                code: runtime_error_code(error),
-                message: error.message().to_string(),
-            }];
+            return error_event(id, runtime_error_code(error), error.message());
         }
 
         let cache_dir = config
@@ -233,66 +244,201 @@ impl RecorderDaemon {
             .map(PathBuf::from)
             .unwrap_or_else(default_cache_dir);
         if let Err(error) = std::fs::create_dir_all(&cache_dir) {
-            return vec![Event::Error {
-                id: Some(id),
-                code: ErrorCode::CacheUnavailable,
-                message: format!("failed to create cache directory: {error}"),
-            }];
+            return error_event(
+                id,
+                ErrorCode::CacheUnavailable,
+                format!("failed to create cache directory: {error}"),
+            );
+        }
+        if let Err(error) = clean_segment_files(&cache_dir) {
+            return error_event(
+                id,
+                ErrorCode::CacheUnavailable,
+                format!("failed to clear stale segments: {error}"),
+            );
         }
 
-        let segment_list = cache_dir.join("segments.csv");
         let segment_pattern = cache_dir.join("segment-%06d.mkv");
-        let process = if self.processes_enabled {
-            let ffmpeg_config =
-                match ffmpeg_config(backend, &config, &segment_pattern, &segment_list) {
-                    Ok(config) => config,
-                    Err(message) => {
-                        return vec![Event::Error {
-                            id: Some(id),
-                            code: ErrorCode::BackendStartFailed,
-                            message,
-                        }];
-                    }
-                };
 
-            match RecorderProcess::start(&ffmpeg_config) {
-                Ok(mut process) => {
-                    thread::sleep(Duration::from_millis(250));
-                    if process.has_exited() {
-                        let stderr = process.stderr_summary();
-                        let message = if stderr.is_empty() {
-                            "ffmpeg backend exited immediately".to_string()
-                        } else {
-                            format!("ffmpeg backend exited immediately: {stderr}")
-                        };
-                        return vec![Event::Error {
-                            id: Some(id),
-                            code: ErrorCode::BackendStartFailed,
-                            message,
-                        }];
-                    }
-                    Some(process)
-                }
-                Err(error) => {
-                    return vec![Event::Error {
-                        id: Some(id),
-                        code: ErrorCode::BackendStartFailed,
-                        message: error.to_string(),
-                    }];
-                }
+        let portal_session = match self.acquire_portal_session(&id, backend, &config) {
+            Ok(session) => session,
+            Err(events) => return events,
+        };
+        let portal_node = portal_session.as_ref().map(|session| session.node_id());
+        #[cfg(unix)]
+        let portal_fd = portal_session
+            .as_ref()
+            .map(|session| session.pipe_wire_fd());
+        #[cfg(not(unix))]
+        let portal_fd: Option<i32> = None;
+
+        let (segment_source, process) = match backend {
+            BackendName::LinuxWaylandGstreamer => {
+                let source = SegmentSource::GstreamerScan {
+                    cache_dir: cache_dir.clone(),
+                    segment_seconds: config.segment_seconds,
+                };
+                let process = match self.spawn_gstreamer(
+                    &id,
+                    &config,
+                    &segment_pattern,
+                    portal_node,
+                    portal_fd,
+                ) {
+                    Ok(process) => process,
+                    Err(events) => return events,
+                };
+                (source, process)
             }
-        } else {
-            None
+            _ => {
+                let segment_list = cache_dir.join("segments.csv");
+                let source = SegmentSource::FfmpegCsv {
+                    list: segment_list.clone(),
+                    cache_dir: cache_dir.clone(),
+                };
+                let process = match self.spawn_ffmpeg(
+                    &id,
+                    backend,
+                    &config,
+                    &segment_pattern,
+                    &segment_list,
+                    portal_node,
+                ) {
+                    Ok(process) => process,
+                    Err(events) => return events,
+                };
+                (source, process)
+            }
         };
 
         self.state.recording = true;
         self.state.backend = Some(backend);
         self.state.segments = Some(SegmentRing::new(config.clip_seconds, 6));
-        self.state.segment_list = Some(segment_list);
-        self.state.cache_dir = Some(cache_dir);
+        self.state.segment_source = Some(segment_source);
         self.state.process = process;
+        self.state.portal_session = portal_session;
 
         vec![Event::RecordingStarted { id, backend }]
+    }
+
+    fn acquire_portal_session(
+        &self,
+        id: &str,
+        backend: BackendName,
+        config: &StartConfig,
+    ) -> Result<Option<PortalSession>, Vec<Event>> {
+        if !self.processes_enabled {
+            return Ok(None);
+        }
+        if config.video_input.is_some() {
+            return Ok(None);
+        }
+        let needs_portal = matches!(
+            backend,
+            BackendName::LinuxWaylandFfmpeg | BackendName::LinuxWaylandGstreamer
+        );
+        if !needs_portal {
+            return Ok(None);
+        }
+
+        match PortalSession::acquire() {
+            Ok(session) => Ok(Some(session)),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to acquire Wayland portal stream");
+                Err(error_event(
+                    id.to_string(),
+                    ErrorCode::BackendStartFailed,
+                    format!("failed to acquire Wayland PipeWire stream node: {error}"),
+                ))
+            }
+        }
+    }
+
+    fn spawn_ffmpeg(
+        &self,
+        id: &str,
+        backend: BackendName,
+        config: &StartConfig,
+        segment_pattern: &Path,
+        segment_list: &Path,
+        portal_node: Option<&str>,
+    ) -> Result<Option<RecorderProcess>, Vec<Event>> {
+        if !self.processes_enabled {
+            return Ok(None);
+        }
+
+        let ffmpeg_config =
+            ffmpeg_config(backend, config, segment_pattern, segment_list, portal_node).map_err(
+                |message| error_event(id.to_string(), ErrorCode::BackendStartFailed, message),
+            )?;
+
+        let mut process = RecorderProcess::start_ffmpeg(&ffmpeg_config).map_err(|error| {
+            error_event(
+                id.to_string(),
+                ErrorCode::BackendStartFailed,
+                error.to_string(),
+            )
+        })?;
+
+        thread::sleep(Duration::from_millis(250));
+        if process.has_exited() {
+            let stderr = process.stderr_summary();
+            let message = if stderr.is_empty() {
+                "ffmpeg backend exited immediately".to_string()
+            } else {
+                format!("ffmpeg backend exited immediately: {stderr}")
+            };
+            return Err(error_event(
+                id.to_string(),
+                ErrorCode::BackendStartFailed,
+                message,
+            ));
+        }
+
+        Ok(Some(process))
+    }
+
+    fn spawn_gstreamer(
+        &self,
+        id: &str,
+        config: &StartConfig,
+        segment_pattern: &Path,
+        portal_node: Option<&str>,
+        portal_fd: Option<i32>,
+    ) -> Result<Option<RecorderProcess>, Vec<Event>> {
+        if !self.processes_enabled {
+            return Ok(None);
+        }
+
+        let gst_config = gstreamer_config(config, segment_pattern, portal_node, portal_fd)
+            .map_err(|message| {
+                error_event(id.to_string(), ErrorCode::BackendStartFailed, message)
+            })?;
+
+        let mut process = RecorderProcess::start_gstreamer(&gst_config).map_err(|error| {
+            error_event(
+                id.to_string(),
+                ErrorCode::BackendStartFailed,
+                error.to_string(),
+            )
+        })?;
+
+        thread::sleep(Duration::from_millis(250));
+        if process.has_exited() {
+            let stderr = process.stderr_summary();
+            let message = if stderr.is_empty() {
+                "gstreamer pipeline exited immediately".to_string()
+            } else {
+                format!("gstreamer pipeline exited immediately: {stderr}")
+            };
+            return Err(error_event(
+                id.to_string(),
+                ErrorCode::BackendStartFailed,
+                message,
+            ));
+        }
+
+        Ok(Some(process))
     }
 
     fn save_last(&mut self, id: String, seconds: u64, output: String) -> Vec<Event> {
@@ -400,9 +546,12 @@ impl RecorderDaemon {
         self.state.recording = false;
         self.state.backend = None;
         self.state.segments = None;
-        self.state.cache_dir = None;
-        self.state.segment_list = None;
+        self.state.segment_source = None;
         self.state.process = None;
+        // Drop the portal session AFTER the recorder process has been torn
+        // down so the PipeWire stream stays alive while gst/ffmpeg is still
+        // shutting down.
+        self.state.portal_session = None;
     }
 
     fn recorder_process_exited(&mut self) -> bool {
@@ -428,21 +577,26 @@ impl RecorderDaemon {
     }
 
     fn refresh_segments(&mut self) -> Result<(), String> {
-        let Some(segment_list) = self.state.segment_list.as_ref() else {
-            return Ok(());
-        };
-        if !segment_list.exists() {
-            return Ok(());
-        }
-
-        let Some(cache_dir) = self.state.cache_dir.as_ref() else {
+        let Some(source) = self.state.segment_source.as_ref() else {
             return Ok(());
         };
 
-        let content = std::fs::read_to_string(segment_list)
-            .map_err(|error| format!("failed to read segment list: {error}"))?;
-        let segments = parse_ffmpeg_segment_list(&content, cache_dir)
-            .map_err(|error| format!("failed to parse segment list: {error}"))?;
+        let segments = match source {
+            SegmentSource::FfmpegCsv { list, cache_dir } => {
+                if !list.exists() {
+                    return Ok(());
+                }
+                let content = std::fs::read_to_string(list)
+                    .map_err(|error| format!("failed to read segment list: {error}"))?;
+                parse_ffmpeg_segment_list(&content, cache_dir)
+                    .map_err(|error| format!("failed to parse segment list: {error}"))?
+            }
+            SegmentSource::GstreamerScan {
+                cache_dir,
+                segment_seconds,
+            } => scan_gstreamer_segments(cache_dir, *segment_seconds)
+                .map_err(|error| format!("failed to scan segments: {error}"))?,
+        };
 
         if let Some(ring) = self.state.segments.as_mut() {
             for segment in ring.replace(segments) {
@@ -460,6 +614,37 @@ impl RecorderDaemon {
 
         Ok(())
     }
+}
+
+fn error_event(id: String, code: ErrorCode, message: impl Into<String>) -> Vec<Event> {
+    vec![Event::Error {
+        id: Some(id),
+        code,
+        message: message.into(),
+    }]
+}
+
+fn clean_segment_files(cache_dir: &Path) -> std::io::Result<()> {
+    let read = match std::fs::read_dir(cache_dir) {
+        Ok(read) => read,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    for entry in read.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("segment-") && name.ends_with(".mkv") {
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn parse_command(line: &str) -> Result<Command, serde_json::Error> {
@@ -509,9 +694,10 @@ pub fn run_jsonl(
 
 fn runtime_error_code(error: RuntimeCheckError) -> ErrorCode {
     match error {
-        RuntimeCheckError::MissingFfmpeg | RuntimeCheckError::MissingFfmpegDevice(_) => {
-            ErrorCode::MissingDependency
-        }
+        RuntimeCheckError::MissingFfmpeg
+        | RuntimeCheckError::MissingFfmpegDevice(_)
+        | RuntimeCheckError::MissingGstreamer
+        | RuntimeCheckError::MissingGstreamerElement(_) => ErrorCode::MissingDependency,
         RuntimeCheckError::WaylandUnavailable
         | RuntimeCheckError::X11Unavailable
         | RuntimeCheckError::UnsupportedPlatform => ErrorCode::UnsupportedSession,
@@ -522,6 +708,7 @@ fn select_backend(selection: BackendSelection, runtime: RuntimeChecks) -> Backen
     match selection {
         BackendSelection::Auto => auto_backend(runtime),
         BackendSelection::LinuxWaylandFfmpeg => BackendName::LinuxWaylandFfmpeg,
+        BackendSelection::LinuxWaylandGstreamer => BackendName::LinuxWaylandGstreamer,
         BackendSelection::LinuxX11Ffmpeg => BackendName::LinuxX11Ffmpeg,
         BackendSelection::WindowsFfmpeg => BackendName::WindowsFfmpeg,
         BackendSelection::MacosFfmpeg => BackendName::MacosFfmpeg,
@@ -530,7 +717,13 @@ fn select_backend(selection: BackendSelection, runtime: RuntimeChecks) -> Backen
 
 fn auto_backend(runtime: RuntimeChecks) -> BackendName {
     match runtime.platform {
-        Platform::Linux if runtime.wayland_display => BackendName::LinuxWaylandFfmpeg,
+        Platform::Linux if runtime.wayland_display => {
+            if runtime.ffmpeg_pipewire {
+                BackendName::LinuxWaylandFfmpeg
+            } else {
+                BackendName::LinuxWaylandGstreamer
+            }
+        }
         Platform::Linux => BackendName::LinuxX11Ffmpeg,
         Platform::Windows => BackendName::WindowsFfmpeg,
         Platform::Macos => BackendName::MacosFfmpeg,
@@ -547,25 +740,14 @@ fn ffmpeg_config(
     config: &StartConfig,
     segment_pattern: &Path,
     segment_list: &Path,
+    portal_node: Option<&str>,
 ) -> Result<FfmpegSegmentConfig, String> {
     let video_input = config
         .video_input
         .clone()
+        .or_else(|| portal_node.map(str::to_string))
         .or_else(|| default_video_input(backend))
-        .or_else(|| {
-            if backend == BackendName::LinuxWaylandFfmpeg {
-                match acquire_wayland_pipewire_node() {
-                    Ok(node) => Some(node),
-                    Err(error) => {
-                        tracing::error!(error = %error, "failed to acquire Wayland portal stream");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| "failed to acquire Wayland PipeWire stream node".to_string())?;
+        .ok_or_else(|| "failed to resolve video input for backend".to_string())?;
 
     Ok(FfmpegSegmentConfig {
         backend,
@@ -580,13 +762,34 @@ fn ffmpeg_config(
 
 fn default_video_input(backend: BackendName) -> Option<String> {
     match backend {
-        BackendName::LinuxWaylandFfmpeg => None,
+        BackendName::LinuxWaylandFfmpeg | BackendName::LinuxWaylandGstreamer => None,
         BackendName::LinuxX11Ffmpeg => {
             Some(std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".to_string()))
         }
         BackendName::WindowsFfmpeg => Some("desktop".to_string()),
         BackendName::MacosFfmpeg => Some("1".to_string()),
     }
+}
+
+fn gstreamer_config(
+    config: &StartConfig,
+    segment_pattern: &Path,
+    portal_node: Option<&str>,
+    portal_fd: Option<i32>,
+) -> Result<GstreamerSegmentConfig, String> {
+    let node_id = config
+        .video_input
+        .clone()
+        .or_else(|| portal_node.map(str::to_string))
+        .ok_or_else(|| "failed to resolve PipeWire node id for gstreamer backend".to_string())?;
+
+    Ok(GstreamerSegmentConfig {
+        node_id,
+        pipe_wire_fd: portal_fd,
+        fps: config.fps.unwrap_or(60),
+        segment_seconds: config.segment_seconds,
+        segment_pattern: segment_pattern.to_path_buf(),
+    })
 }
 
 #[cfg(test)]
@@ -601,6 +804,12 @@ mod tests {
         ffmpeg_gdigrab: true,
         ffmpeg_dshow: true,
         ffmpeg_avfoundation: true,
+        gstreamer_available: true,
+        gstreamer_pipewiresrc: true,
+        gstreamer_videoconvert: true,
+        gstreamer_x264enc: true,
+        gstreamer_matroskamux: true,
+        gstreamer_splitmuxsink: true,
         wayland_display: true,
         x11_display: true,
     };
@@ -812,6 +1021,179 @@ mod tests {
             select_backend(BackendSelection::Auto, runtime),
             BackendName::LinuxX11Ffmpeg
         );
+    }
+
+    #[test]
+    fn auto_backend_picks_gstreamer_on_wayland_without_ffmpeg_pipewire() {
+        let runtime = RuntimeChecks {
+            ffmpeg_pipewire: false,
+            ..TEST_RUNTIME
+        };
+
+        assert_eq!(
+            select_backend(BackendSelection::Auto, runtime),
+            BackendName::LinuxWaylandGstreamer
+        );
+    }
+
+    #[test]
+    fn parses_gstreamer_backend_selection() {
+        let command = parse_command(
+            r#"{"id":"1","cmd":"start","config":{"clip_seconds":30,"segment_seconds":2,"backend":"linux-wayland-gstreamer"}}"#,
+        )
+        .expect("valid command");
+
+        assert!(matches!(
+            command,
+            Command::Start {
+                config: StartConfig {
+                    backend: BackendSelection::LinuxWaylandGstreamer,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gstreamer_start_records_scan_source() {
+        let cache_dir =
+            std::env::temp_dir().join(format!("skia-gst-source-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let mut daemon = RecorderDaemon::with_runtime(TEST_RUNTIME);
+        let events = daemon.handle_command(Command::Start {
+            id: "start-1".to_string(),
+            config: StartConfig {
+                clip_seconds: 30,
+                segment_seconds: 2,
+                backend: BackendSelection::LinuxWaylandGstreamer,
+                cache_dir: Some(cache_dir.display().to_string()),
+                fps: Some(30),
+                video_input: Some("99".to_string()),
+                audio_input: None,
+            },
+        });
+
+        assert_eq!(
+            events,
+            vec![Event::RecordingStarted {
+                id: "start-1".to_string(),
+                backend: BackendName::LinuxWaylandGstreamer,
+            }]
+        );
+
+        match daemon.state.segment_source.as_ref() {
+            Some(SegmentSource::GstreamerScan {
+                cache_dir: dir,
+                segment_seconds,
+            }) => {
+                assert_eq!(dir, &cache_dir);
+                assert_eq!(*segment_seconds, 2);
+            }
+            other => panic!("expected GstreamerScan source, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn gstreamer_refresh_reads_directory_segments() {
+        let cache_dir =
+            std::env::temp_dir().join(format!("skia-gst-refresh-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let mut daemon = RecorderDaemon::with_runtime(TEST_RUNTIME);
+        daemon.handle_command(Command::Start {
+            id: "start-1".to_string(),
+            config: StartConfig {
+                clip_seconds: 30,
+                segment_seconds: 2,
+                backend: BackendSelection::LinuxWaylandGstreamer,
+                cache_dir: Some(cache_dir.display().to_string()),
+                fps: None,
+                video_input: Some("99".to_string()),
+                audio_input: None,
+            },
+        });
+
+        for index in 0..3 {
+            std::fs::write(
+                cache_dir.join(format!("segment-{index:06}.mkv")),
+                b"placeholder",
+            )
+            .expect("write segment");
+        }
+
+        daemon.refresh_segments().expect("refresh segments");
+        let selected = daemon
+            .state
+            .segments
+            .as_ref()
+            .expect("ring")
+            .select_last(30);
+
+        assert_eq!(
+            selected,
+            vec![
+                Segment::new(cache_dir.join("segment-000000.mkv"), 0, 2000),
+                Segment::new(cache_dir.join("segment-000001.mkv"), 2000, 4000),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn gstreamer_start_returns_error_when_runtime_missing_element() {
+        let runtime = RuntimeChecks {
+            gstreamer_pipewiresrc: false,
+            ..TEST_RUNTIME
+        };
+        let mut daemon = RecorderDaemon::with_runtime(runtime);
+
+        let events = daemon.handle_command(Command::Start {
+            id: "start-1".to_string(),
+            config: StartConfig {
+                clip_seconds: 30,
+                segment_seconds: 2,
+                backend: BackendSelection::LinuxWaylandGstreamer,
+                cache_dir: None,
+                fps: None,
+                video_input: None,
+                audio_input: None,
+            },
+        });
+
+        assert_eq!(
+            events,
+            vec![Event::Error {
+                id: Some("start-1".to_string()),
+                code: ErrorCode::MissingDependency,
+                message: "gstreamer is missing required element: pipewiresrc".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn clean_segment_files_removes_stale_segments_only() {
+        let cache_dir =
+            std::env::temp_dir().join(format!("skia-clean-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+        std::fs::write(cache_dir.join("segment-000000.mkv"), b"x").expect("write seg0");
+        std::fs::write(cache_dir.join("segment-000005.mkv"), b"x").expect("write seg5");
+        std::fs::write(cache_dir.join("segments.csv"), b"keep").expect("write csv");
+        std::fs::write(cache_dir.join("notes.txt"), b"keep").expect("write notes");
+
+        clean_segment_files(&cache_dir).expect("clean");
+
+        assert!(!cache_dir.join("segment-000000.mkv").exists());
+        assert!(!cache_dir.join("segment-000005.mkv").exists());
+        assert!(cache_dir.join("segments.csv").exists());
+        assert!(cache_dir.join("notes.txt").exists());
+
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]

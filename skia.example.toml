@@ -1,13 +1,21 @@
 [recording]
 clip_seconds = 30
 segment_seconds = 2
+# backend choices:
+#   auto                       — pick by platform/runtime
+#   linux-wayland-ffmpeg       — Wayland via FFmpeg `-f pipewire` (needs FFmpeg with pipewire device)
+#   linux-wayland-gstreamer    — Wayland via gst-launch-1.0 pipewiresrc + splitmuxsink (recommended on Arch)
+#   linux-x11-ffmpeg           — X11 via FFmpeg x11grab
+#   windows-ffmpeg             — Windows via FFmpeg gdigrab
+#   macos-ffmpeg               — macOS via FFmpeg avfoundation
 backend = "auto"
 fps = 60
 cache_dir = ".cache/skia"
 
 # Optional overrides.
-# Wayland normally gets video_input from XDG Desktop Portal.
+# Wayland normally gets video_input from XDG Desktop Portal (the screen-share picker).
 # X11 can use ":0.0"; Windows can use "desktop"; macOS can use "1".
+# For linux-wayland-gstreamer, video_input may also be a PipeWire node id as a string.
 # video_input = ":0.0"
 # audio_input = "default"
 

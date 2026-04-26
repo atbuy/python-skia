@@ -610,6 +610,7 @@ dependencies = [
  "anyhow",
  "ashpd",
  "csv",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

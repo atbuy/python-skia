@@ -24,6 +24,10 @@ pub enum GstreamerVideoEncoder {
     X264,
     /// NVIDIA NVENC h264 (`nvh264enc` from gst-plugins-bad / gstreamer-nvcodec).
     Nvh264,
+    /// VA-API h264 via the modern `vah264enc` element (gst-plugins-bad va plugin).
+    Vah264,
+    /// VA-API h264 via the legacy `vaapih264enc` element (gstreamer-vaapi).
+    Vaapih264,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,6 +373,22 @@ pub fn gstreamer_segment_args(
                 format!("gop-size={}", key_int_max),
             ]);
         }
+        GstreamerVideoEncoder::Vah264 => {
+            args.extend([
+                "vah264enc".to_string(),
+                "rate-control=vbr".to_string(),
+                "bitrate=20000".to_string(),
+                format!("key-int-max={}", key_int_max),
+            ]);
+        }
+        GstreamerVideoEncoder::Vaapih264 => {
+            args.extend([
+                "vaapih264enc".to_string(),
+                "rate-control=vbr".to_string(),
+                "bitrate=20000".to_string(),
+                format!("keyframe-period={}", key_int_max),
+            ]);
+        }
     }
 
     args.extend(["!".to_string(), "mux.video".to_string()]);
@@ -624,6 +644,35 @@ segment-000001.mkv,2.000000,4.000000\n";
         assert!(!args.iter().any(|arg| arg == "pulsesrc"));
         assert!(!args.iter().any(|arg| arg == "opusenc"));
         assert!(!args.iter().any(|arg| arg == "mux.audio_0"));
+    }
+
+    #[test]
+    fn uses_vah264_when_encoder_is_vah264() {
+        let mut config = gst_config();
+        config.video_encoder = GstreamerVideoEncoder::Vah264;
+
+        let args = gstreamer_segment_args(&config).expect("args");
+
+        assert!(args.iter().any(|arg| arg == "vah264enc"));
+        assert!(args.iter().any(|arg| arg == "rate-control=vbr"));
+        assert!(args.iter().any(|arg| arg == "bitrate=20000"));
+        assert!(args.iter().any(|arg| arg == "key-int-max=120"));
+        assert!(!args.iter().any(|arg| arg == "x264enc"));
+        assert!(!args.iter().any(|arg| arg == "nvh264enc"));
+    }
+
+    #[test]
+    fn uses_vaapih264_when_encoder_is_vaapih264() {
+        let mut config = gst_config();
+        config.video_encoder = GstreamerVideoEncoder::Vaapih264;
+
+        let args = gstreamer_segment_args(&config).expect("args");
+
+        assert!(args.iter().any(|arg| arg == "vaapih264enc"));
+        assert!(args.iter().any(|arg| arg == "rate-control=vbr"));
+        assert!(args.iter().any(|arg| arg == "bitrate=20000"));
+        assert!(args.iter().any(|arg| arg == "keyframe-period=120"));
+        assert!(!args.iter().any(|arg| arg == "x264enc"));
     }
 
     #[test]

@@ -790,6 +790,10 @@ fn gstreamer_config(
 
     let video_encoder = if runtime.gstreamer_nvh264enc {
         GstreamerVideoEncoder::Nvh264
+    } else if runtime.gstreamer_vah264enc {
+        GstreamerVideoEncoder::Vah264
+    } else if runtime.gstreamer_vaapih264enc {
+        GstreamerVideoEncoder::Vaapih264
     } else {
         GstreamerVideoEncoder::X264
     };
@@ -822,6 +826,8 @@ mod tests {
         gstreamer_videoconvert: true,
         gstreamer_x264enc: true,
         gstreamer_nvh264enc: false,
+        gstreamer_vah264enc: false,
+        gstreamer_vaapih264enc: false,
         gstreamer_matroskamux: true,
         gstreamer_splitmuxsink: true,
         wayland_display: true,

@@ -25,6 +25,8 @@ pub struct RuntimeChecks {
     pub gstreamer_videoconvert: bool,
     pub gstreamer_x264enc: bool,
     pub gstreamer_nvh264enc: bool,
+    pub gstreamer_vah264enc: bool,
+    pub gstreamer_vaapih264enc: bool,
     pub gstreamer_matroskamux: bool,
     pub gstreamer_splitmuxsink: bool,
     pub wayland_display: bool,
@@ -50,6 +52,9 @@ impl RuntimeChecks {
                 && gstreamer_element_available("videoconvert"),
             gstreamer_x264enc: gstreamer_available && gstreamer_element_available("x264enc"),
             gstreamer_nvh264enc: gstreamer_available && gstreamer_element_available("nvh264enc"),
+            gstreamer_vah264enc: gstreamer_available && gstreamer_element_available("vah264enc"),
+            gstreamer_vaapih264enc: gstreamer_available
+                && gstreamer_element_available("vaapih264enc"),
             gstreamer_matroskamux: gstreamer_available
                 && gstreamer_element_available("matroskamux"),
             gstreamer_splitmuxsink: gstreamer_available
@@ -129,9 +134,13 @@ pub fn validate_backend(
             if !checks.gstreamer_videoconvert {
                 return Err(RuntimeCheckError::MissingGstreamerElement("videoconvert"));
             }
-            if !checks.gstreamer_x264enc && !checks.gstreamer_nvh264enc {
+            if !checks.gstreamer_x264enc
+                && !checks.gstreamer_nvh264enc
+                && !checks.gstreamer_vah264enc
+                && !checks.gstreamer_vaapih264enc
+            {
                 return Err(RuntimeCheckError::MissingGstreamerElement(
-                    "h264 encoder (x264enc or nvh264enc)",
+                    "h264 encoder (x264enc, nvh264enc, vah264enc, or vaapih264enc)",
                 ));
             }
             if !checks.gstreamer_matroskamux {
@@ -227,6 +236,8 @@ mod tests {
         gstreamer_videoconvert: true,
         gstreamer_x264enc: true,
         gstreamer_nvh264enc: false,
+        gstreamer_vah264enc: false,
+        gstreamer_vaapih264enc: false,
         gstreamer_matroskamux: true,
         gstreamer_splitmuxsink: true,
         wayland_display: true,
@@ -324,6 +335,39 @@ mod tests {
         assert_eq!(
             validate_backend(BackendName::LinuxWaylandGstreamer, checks),
             Err(RuntimeCheckError::MissingGstreamerElement("pipewiresrc"))
+        );
+    }
+
+    #[test]
+    fn accepts_vaapi_only_h264_encoder() {
+        let checks = RuntimeChecks {
+            gstreamer_x264enc: false,
+            gstreamer_nvh264enc: false,
+            gstreamer_vah264enc: true,
+            ..LINUX_WAYLAND
+        };
+
+        assert_eq!(
+            validate_backend(BackendName::LinuxWaylandGstreamer, checks),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_when_no_h264_encoder_present() {
+        let checks = RuntimeChecks {
+            gstreamer_x264enc: false,
+            gstreamer_nvh264enc: false,
+            gstreamer_vah264enc: false,
+            gstreamer_vaapih264enc: false,
+            ..LINUX_WAYLAND
+        };
+
+        assert_eq!(
+            validate_backend(BackendName::LinuxWaylandGstreamer, checks),
+            Err(RuntimeCheckError::MissingGstreamerElement(
+                "h264 encoder (x264enc, nvh264enc, vah264enc, or vaapih264enc)"
+            ))
         );
     }
 

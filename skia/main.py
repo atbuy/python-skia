@@ -89,6 +89,12 @@ class SkiaApp:
             self.recorder.close()
 
     def start_recorder(self) -> None:
+        audio_input = self.config.audio_input
+        if audio_input is None:
+            audio_input = _detect_default_audio_monitor()
+            if audio_input is not None:
+                print(f"Auto-detected audio source: {audio_input}")
+
         self.recorder.start_process()
         self.recorder.start_recording(
             clip_seconds=self.config.clip_seconds,
@@ -97,7 +103,7 @@ class SkiaApp:
             fps=self.config.fps,
             cache_dir=self.config.cache_dir,
             video_input=self.config.video_input,
-            audio_input=self.config.audio_input,
+            audio_input=audio_input,
         )
 
     def save_clip(self) -> None:
@@ -259,6 +265,26 @@ def _make_thumbnail(clip: Path) -> Path | None:
             pass
         return None
     return tmp
+
+
+def _detect_default_audio_monitor() -> str | None:
+    if shutil.which("pactl") is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["pactl", "get-default-sink"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sink = result.stdout.strip()
+    if not sink:
+        return None
+    return f"{sink}.monitor"
 
 
 def _open_folder(folder: Path) -> None:

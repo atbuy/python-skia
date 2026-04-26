@@ -786,6 +786,7 @@ fn gstreamer_config(
     Ok(GstreamerSegmentConfig {
         node_id,
         pipe_wire_fd: portal_fd,
+        audio_input: config.audio_input.clone(),
         fps: config.fps.unwrap_or(60),
         segment_seconds: config.segment_seconds,
         segment_pattern: segment_pattern.to_path_buf(),

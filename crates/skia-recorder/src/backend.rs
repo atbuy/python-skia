@@ -26,6 +26,9 @@ pub struct GstreamerSegmentConfig {
     /// instance; without it the node id is only valid on the user's default
     /// PipeWire socket, which the portal does not publish to.
     pub pipe_wire_fd: Option<i32>,
+    /// PulseAudio (or pipewire-pulse) source device name. None = no audio
+    /// branch in the pipeline.
+    pub audio_input: Option<String>,
     pub fps: u32,
     pub segment_seconds: u64,
     pub segment_pattern: PathBuf,
@@ -313,7 +316,17 @@ pub fn gstreamer_segment_args(
     let segment_ns = config.segment_seconds.saturating_mul(1_000_000_000);
     let key_int_max = (config.fps as u64).saturating_mul(config.segment_seconds.max(1));
 
-    let mut args = vec!["-e".to_string(), "pipewiresrc".to_string()];
+    let mut args = vec![
+        "-e".to_string(),
+        "splitmuxsink".to_string(),
+        "name=mux".to_string(),
+        format!("location={}", config.segment_pattern.display()),
+        format!("max-size-time={}", segment_ns),
+        "muxer-factory=matroskamux".to_string(),
+        "send-keyframe-requests=true".to_string(),
+    ];
+
+    args.push("pipewiresrc".to_string());
     if let Some(fd) = config.pipe_wire_fd {
         args.push(format!("fd={fd}"));
     }
@@ -331,12 +344,26 @@ pub fn gstreamer_segment_args(
         "speed-preset=veryfast".to_string(),
         format!("key-int-max={}", key_int_max),
         "!".to_string(),
-        "splitmuxsink".to_string(),
-        format!("location={}", config.segment_pattern.display()),
-        format!("max-size-time={}", segment_ns),
-        "muxer-factory=matroskamux".to_string(),
-        "send-keyframe-requests=true".to_string(),
+        "mux.video".to_string(),
     ]);
+
+    if let Some(audio) = &config.audio_input {
+        args.extend([
+            "pulsesrc".to_string(),
+            format!("device={audio}"),
+            "!".to_string(),
+            "queue".to_string(),
+            "!".to_string(),
+            "audioconvert".to_string(),
+            "!".to_string(),
+            "audioresample".to_string(),
+            "!".to_string(),
+            "opusenc".to_string(),
+            "!".to_string(),
+            "mux.audio_0".to_string(),
+        ]);
+    }
+
     Ok(args)
 }
 
@@ -514,6 +541,7 @@ segment-000001.mkv,2.000000,4.000000\n";
         GstreamerSegmentConfig {
             node_id: "42".to_string(),
             pipe_wire_fd: None,
+            audio_input: None,
             fps: 60,
             segment_seconds: 2,
             segment_pattern: "/tmp/skia/segment-%06d.mkv".into(),
@@ -560,6 +588,34 @@ segment-000001.mkv,2.000000,4.000000\n";
     fn omits_fd_when_not_provided() {
         let args = gstreamer_segment_args(&gst_config()).expect("args");
         assert!(!args.iter().any(|arg| arg.starts_with("fd=")));
+    }
+
+    #[test]
+    fn omits_audio_branch_by_default() {
+        let args = gstreamer_segment_args(&gst_config()).expect("args");
+        assert!(!args.iter().any(|arg| arg == "pulsesrc"));
+        assert!(!args.iter().any(|arg| arg == "opusenc"));
+        assert!(!args.iter().any(|arg| arg == "mux.audio_0"));
+    }
+
+    #[test]
+    fn includes_audio_branch_when_audio_input_set() {
+        let mut config = gst_config();
+        config.audio_input = Some("alsa_output.pci.monitor".to_string());
+
+        let args = gstreamer_segment_args(&config).expect("args");
+
+        assert!(args.iter().any(|arg| arg == "pulsesrc"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "device=alsa_output.pci.monitor")
+        );
+        assert!(args.iter().any(|arg| arg == "audioconvert"));
+        assert!(args.iter().any(|arg| arg == "audioresample"));
+        assert!(args.iter().any(|arg| arg == "opusenc"));
+        assert!(args.iter().any(|arg| arg == "mux.audio_0"));
+        assert!(args.iter().any(|arg| arg == "mux.video"));
+        assert!(args.iter().any(|arg| arg == "name=mux"));
     }
 
     #[test]

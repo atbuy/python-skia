@@ -1,8 +1,11 @@
 import argparse
 from datetime import datetime
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
 from typing import Any
 
@@ -127,9 +130,13 @@ class SkiaApp:
         elif event_type == "recording_started":
             print(f"Recording with backend: {event.get('backend')}")
         elif event_type == "clip_saved":
-            path = str(event.get("path"))
+            path = Path(str(event.get("path")))
             print(f"Clip saved: {path}")
-            self._notify("Skia", f"Clip saved: {path}")
+            threading.Thread(
+                target=self._notify_clip_saved,
+                args=(path,),
+                daemon=True,
+            ).start()
         elif event_type == "error":
             message = str(event.get("message", "unknown recorder error"))
             print(f"Recorder error: {message}")
@@ -146,11 +153,123 @@ class SkiaApp:
             return
 
         subprocess.run(
-            ["notify-send", title, message],
+            ["notify-send", "--app-name=Skia", title, message],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+    def _notify_clip_saved(self, path: Path) -> None:
+        if shutil.which("notify-send") is None:
+            return
+
+        thumbnail = _make_thumbnail(path)
+        try:
+            args = ["notify-send", "--app-name=Skia"]
+            if thumbnail is not None:
+                args.append(f"--icon={thumbnail}")
+
+            if _notify_send_supports_actions():
+                args += ["--action=open=Open folder", "--wait"]
+                args += ["Skia", f"Clip saved: {path}"]
+                try:
+                    result = subprocess.run(
+                        args,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                except subprocess.TimeoutExpired:
+                    return
+                if result.returncode == 0 and result.stdout.strip() == "open":
+                    _open_folder(path.parent)
+            else:
+                args += ["Skia", f"Clip saved: {path}"]
+                subprocess.run(
+                    args,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        finally:
+            if thumbnail is not None:
+                try:
+                    thumbnail.unlink()
+                except OSError:
+                    pass
+
+
+_action_support: bool | None = None
+_action_support_lock = threading.Lock()
+
+
+def _notify_send_supports_actions() -> bool:
+    global _action_support
+    with _action_support_lock:
+        if _action_support is None:
+            try:
+                output = subprocess.run(
+                    ["notify-send", "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                combined = (output.stdout or "") + (output.stderr or "")
+                _action_support = "--action" in combined
+            except (OSError, subprocess.SubprocessError):
+                _action_support = False
+        return _action_support
+
+
+def _make_thumbnail(clip: Path) -> Path | None:
+    if shutil.which("ffmpeg") is None:
+        return None
+
+    fd, tmp_path = tempfile.mkstemp(prefix="skia-thumb-", suffix=".png")
+    os.close(fd)
+    tmp = Path(tmp_path)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-ss",
+        "1",
+        "-i",
+        str(clip),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=320:-1",
+        str(tmp),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+
+    if result.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+    return tmp
+
+
+def _open_folder(folder: Path) -> None:
+    opener = shutil.which("xdg-open") or shutil.which("open")
+    if opener is None:
+        return
+    subprocess.Popen(
+        [opener, str(folder)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def main():

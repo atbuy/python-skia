@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from skia.config import SkiaConfig, load_config
+from skia.control_socket import ControlSocketServer, default_socket_path
 from skia.recorder_client import RecorderClient
 
 
@@ -19,21 +20,30 @@ class SkiaApp:
         self.recorder = RecorderClient(on_event=self._on_event, on_log=self._on_log)
 
     def start(self) -> None:
-        from pynput import keyboard
-
         print("Starting Skia...")
         self.start_recorder()
 
-        with keyboard.GlobalHotKeys({self.config.hotkey: self.save_clip}) as hotkeys:
-            try:
-                while True:
-                    time.sleep(0.25)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                hotkeys.stop()
-                self.recorder.close()
-                print("Stopped Skia.")
+        socket_path = default_socket_path()
+        server = ControlSocketServer(socket_path, on_command=self._handle_socket_command)
+        server.start()
+        print(f"Control socket: {socket_path}")
+        print(f"Bind a compositor hotkey to: python -m skia.save")
+
+        try:
+            while True:
+                time.sleep(0.25)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.stop()
+            self.recorder.close()
+            print("Stopped Skia.")
+
+    def _handle_socket_command(self, command: str) -> None:
+        if command == "save":
+            self.save_clip()
+        else:
+            print(f"unknown control command: {command!r}")
 
     def smoke(self, *, warmup_seconds: float) -> int:
         print("Starting Skia smoke test...")

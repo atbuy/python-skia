@@ -146,11 +146,22 @@ mod imp {
             }
         };
 
+        let cursor_mode = match proxy.available_cursor_modes().await {
+            Ok(modes) if modes.contains(CursorMode::Metadata) => CursorMode::Metadata,
+            Ok(modes) if modes.contains(CursorMode::Embedded) => CursorMode::Embedded,
+            Ok(modes) if modes.contains(CursorMode::Hidden) => CursorMode::Hidden,
+            Ok(_) => CursorMode::Hidden,
+            Err(error) => {
+                let _ = stream_tx.send(Err(PortalError::Session(error.to_string())));
+                return;
+            }
+        };
+
         if let Err(error) = proxy
             .select_sources(
                 &session,
                 SelectSourcesOptions::default()
-                    .set_cursor_mode(CursorMode::Metadata)
+                    .set_cursor_mode(cursor_mode)
                     .set_sources(SourceType::Monitor | SourceType::Window)
                     .set_multiple(false)
                     .set_persist_mode(PersistMode::DoNot),

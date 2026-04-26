@@ -18,6 +18,14 @@ pub struct FfmpegSegmentConfig {
     pub segment_list: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GstreamerVideoEncoder {
+    /// Software x264 (universal fallback).
+    X264,
+    /// NVIDIA NVENC h264 (`nvh264enc` from gst-plugins-bad / gstreamer-nvcodec).
+    Nvh264,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GstreamerSegmentConfig {
     pub node_id: String,
@@ -32,6 +40,7 @@ pub struct GstreamerSegmentConfig {
     pub fps: u32,
     pub segment_seconds: u64,
     pub segment_pattern: PathBuf,
+    pub video_encoder: GstreamerVideoEncoder,
 }
 
 #[derive(Debug)]
@@ -339,13 +348,30 @@ pub fn gstreamer_segment_args(
         "!".to_string(),
         "queue".to_string(),
         "!".to_string(),
-        "x264enc".to_string(),
-        "tune=zerolatency".to_string(),
-        "speed-preset=veryfast".to_string(),
-        format!("key-int-max={}", key_int_max),
-        "!".to_string(),
-        "mux.video".to_string(),
     ]);
+
+    match config.video_encoder {
+        GstreamerVideoEncoder::X264 => {
+            args.extend([
+                "x264enc".to_string(),
+                "speed-preset=medium".to_string(),
+                "pass=qual".to_string(),
+                "quantizer=20".to_string(),
+                format!("key-int-max={}", key_int_max),
+            ]);
+        }
+        GstreamerVideoEncoder::Nvh264 => {
+            args.extend([
+                "nvh264enc".to_string(),
+                "preset=hq".to_string(),
+                "rc-mode=vbr-hq".to_string(),
+                "bitrate=20000".to_string(),
+                format!("gop-size={}", key_int_max),
+            ]);
+        }
+    }
+
+    args.extend(["!".to_string(), "mux.video".to_string()]);
 
     if let Some(audio) = &config.audio_input {
         args.extend([
@@ -359,6 +385,7 @@ pub fn gstreamer_segment_args(
             "audioresample".to_string(),
             "!".to_string(),
             "opusenc".to_string(),
+            "bitrate=160000".to_string(),
             "!".to_string(),
             "mux.audio_0".to_string(),
         ]);
@@ -545,6 +572,7 @@ segment-000001.mkv,2.000000,4.000000\n";
             fps: 60,
             segment_seconds: 2,
             segment_pattern: "/tmp/skia/segment-%06d.mkv".into(),
+            video_encoder: GstreamerVideoEncoder::X264,
         }
     }
 
@@ -596,6 +624,21 @@ segment-000001.mkv,2.000000,4.000000\n";
         assert!(!args.iter().any(|arg| arg == "pulsesrc"));
         assert!(!args.iter().any(|arg| arg == "opusenc"));
         assert!(!args.iter().any(|arg| arg == "mux.audio_0"));
+    }
+
+    #[test]
+    fn uses_nvenc_when_encoder_is_nvh264() {
+        let mut config = gst_config();
+        config.video_encoder = GstreamerVideoEncoder::Nvh264;
+
+        let args = gstreamer_segment_args(&config).expect("args");
+
+        assert!(args.iter().any(|arg| arg == "nvh264enc"));
+        assert!(args.iter().any(|arg| arg == "preset=hq"));
+        assert!(args.iter().any(|arg| arg == "rc-mode=vbr-hq"));
+        assert!(args.iter().any(|arg| arg == "bitrate=20000"));
+        assert!(args.iter().any(|arg| arg == "gop-size=120"));
+        assert!(!args.iter().any(|arg| arg == "x264enc"));
     }
 
     #[test]

@@ -13,8 +13,8 @@ mod runtime;
 mod segment;
 
 pub use backend::{
-    BackendCommandError, FfmpegSegmentConfig, GstreamerSegmentConfig, RecorderProcess,
-    ffmpeg_segment_args, gstreamer_segment_args, parse_ffmpeg_segment_list,
+    BackendCommandError, FfmpegSegmentConfig, GstreamerSegmentConfig, GstreamerVideoEncoder,
+    RecorderProcess, ffmpeg_segment_args, gstreamer_segment_args, parse_ffmpeg_segment_list,
     scan_gstreamer_segments,
 };
 pub use export::{ExportError, export_clip, ffmpeg_args, write_concat_file};
@@ -410,10 +410,14 @@ impl RecorderDaemon {
             return Ok(None);
         }
 
-        let gst_config = gstreamer_config(config, segment_pattern, portal_node, portal_fd)
-            .map_err(|message| {
-                error_event(id.to_string(), ErrorCode::BackendStartFailed, message)
-            })?;
+        let gst_config = gstreamer_config(
+            config,
+            segment_pattern,
+            portal_node,
+            portal_fd,
+            self.runtime,
+        )
+        .map_err(|message| error_event(id.to_string(), ErrorCode::BackendStartFailed, message))?;
 
         let mut process = RecorderProcess::start_gstreamer(&gst_config).map_err(|error| {
             error_event(
@@ -776,12 +780,19 @@ fn gstreamer_config(
     segment_pattern: &Path,
     portal_node: Option<&str>,
     portal_fd: Option<i32>,
+    runtime: RuntimeChecks,
 ) -> Result<GstreamerSegmentConfig, String> {
     let node_id = config
         .video_input
         .clone()
         .or_else(|| portal_node.map(str::to_string))
         .ok_or_else(|| "failed to resolve PipeWire node id for gstreamer backend".to_string())?;
+
+    let video_encoder = if runtime.gstreamer_nvh264enc {
+        GstreamerVideoEncoder::Nvh264
+    } else {
+        GstreamerVideoEncoder::X264
+    };
 
     Ok(GstreamerSegmentConfig {
         node_id,
@@ -790,6 +801,7 @@ fn gstreamer_config(
         fps: config.fps.unwrap_or(60),
         segment_seconds: config.segment_seconds,
         segment_pattern: segment_pattern.to_path_buf(),
+        video_encoder,
     })
 }
 
@@ -809,6 +821,7 @@ mod tests {
         gstreamer_pipewiresrc: true,
         gstreamer_videoconvert: true,
         gstreamer_x264enc: true,
+        gstreamer_nvh264enc: false,
         gstreamer_matroskamux: true,
         gstreamer_splitmuxsink: true,
         wayland_display: true,
